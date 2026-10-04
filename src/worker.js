@@ -30,6 +30,11 @@ export default {
         return await stub.fetch(request);
       }
 
+      // 服务端账户与房间加入 API（跨浏览器共享登录态）
+      if (url.pathname.startsWith("/api/")) {
+        return await stub.fetch(request);
+      }
+
       // 未配置 LOG_PASSWORD 时 /log 和 /log/clear 不路由到 Durable Object，直接跳转项目地址
       if (env.LOG_PASSWORD && (url.pathname === "/log" || url.pathname === "/log/clear")) {
         return await stub.fetch(request);

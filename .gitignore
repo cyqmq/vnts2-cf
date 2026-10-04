@@ -2,3 +2,5 @@ src/version.js
 node_modules/
 .wrangler/
 *.log
+test/PORT
+test/logs/

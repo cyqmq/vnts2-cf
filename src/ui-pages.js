@@ -165,7 +165,7 @@ createApp({
 }
 
 /* ============================================================
- * 登录页（公开，用户名+密码，localStorage 分用户）
+ * 登录页（公开，用户名+密码，服务端账户跨浏览器共享）
  * ============================================================ */
 export function renderLoginPage() {
   const content = `
@@ -187,7 +187,7 @@ export function renderLoginPage() {
         <label>密码</label>
         <input class="form-input" v-model="form.password" type="password" placeholder="输入密码" @keyup.enter="submit" />
       </div>
-      <button class="btn btn-primary" style="width:100%" @click="submit">登录 / 注册</button>
+      <button class="btn btn-primary" style="width:100%" :disabled="loading" @click="submit">{{ loading ? '登录中…' : '登录 / 注册' }}</button>
       <div class="auth-desc" style="text-align:center;margin-top:14px;">新用户名首次输入即自动注册，不同用户拥有独立个人页</div>
       <div style="text-align:center;margin-top:14px;border-top:1px solid var(--divider);padding-top:14px;">
         <a href="/health">无需登录，直接查看健康检测 →</a>
@@ -198,34 +198,37 @@ export function renderLoginPage() {
 
   const script = `
 const { createApp } = Vue;
-const USERS_KEY = 'vnts2_users';
-const CURRENT_KEY = 'vnts2_current_user';
-function hash(str) { let h = 5381; for (let i = 0; i < str.length; i++) { h = ((h << 5) + h) ^ str.charCodeAt(i); } return (h >>> 0).toString(36); }
-function loadUsers() { try { return JSON.parse(localStorage.getItem(USERS_KEY) || '{}'); } catch (e) { return {}; } }
-function saveUsers(u) { localStorage.setItem(USERS_KEY, JSON.stringify(u)); }
+// 清理旧版 localStorage 登录/房间状态，避免与新账户体系混用
+try {
+  localStorage.removeItem('vnts2_users');
+  localStorage.removeItem('vnts2_current_user');
+  localStorage.removeItem('vnts2_joined_rooms');
+} catch (e) {}
 createApp({
   data() {
-    return { form: { username: '', password: '' }, error: '' };
+    return { form: { username: '', password: '' }, error: '', loading: false };
   },
   methods: {
-    submit() {
+    async submit() {
       const name = this.form.username.trim();
       if (!name || !this.form.password) { this.error = '请输入用户名和密码'; return; }
-      const users = loadUsers();
-      if (users[name]) {
-        if (users[name].passwordHash !== hash(this.form.password)) { this.error = '密码不正确'; return; }
-      } else {
-        users[name] = {
-          passwordHash: hash(this.form.password),
-          deviceName: name,
-          virtualIp: '',
-          createdAt: new Date().toLocaleString('zh-CN')
-        };
-        saveUsers(users);
+      this.error = '';
+      this.loading = true;
+      try {
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ username: name, password: this.form.password })
+        });
+        const data = await res.json();
+        if (!data.ok) { this.error = data.error || '登录失败'; return; }
+        const redirect = new URLSearchParams(location.search).get('redirect') || '/dashboard';
+        location.href = redirect;
+      } catch (e) {
+        this.error = '网络错误，请重试';
+      } finally {
+        this.loading = false;
       }
-      localStorage.setItem(CURRENT_KEY, name);
-      const redirect = new URLSearchParams(location.search).get('redirect') || '/dashboard';
-      location.href = redirect;
     }
   }
 }).mount('#app');
@@ -421,6 +424,7 @@ export function renderDashboardHtml(data) {
   const status = data.status || {};
   const config = data.config || {};
   const rooms = data.rooms || [];
+  const relayDisabled = !!(config.environment && config.environment.DISABLE_RELAY === "1");
   const content = `
 <div id="app">
   <div class="dash-grid">
@@ -437,8 +441,8 @@ export function renderDashboardHtml(data) {
         </svg>
       </div>
       <div class="dash-footer">
-        <span><span style="color:var(--error);font-weight:600;">↑ 上传</span> 6.88 KB/s</span>
-        <span><span style="color:var(--success);font-weight:600;">↓ 下载</span> 28.69 KB/s</span>
+        <span><span style="color:var(--error);font-weight:600;">↑ 上传</span> {{ uploadSpeed }}</span>
+        <span><span style="color:var(--success);font-weight:600;">↓ 下载</span> {{ downloadSpeed }}</span>
       </div>
     </div>
 
@@ -450,17 +454,16 @@ export function renderDashboardHtml(data) {
         <svg viewBox="0 0 80 80" width="80" height="80" style="flex-shrink:0;">
           <circle cx="40" cy="40" r="34" fill="none" stroke="rgba(0,191,165,.15)" stroke-width="8"/>
           <circle cx="40" cy="40" r="34" fill="none" stroke="#00BFA5" stroke-width="8" stroke-linecap="round" stroke-dasharray="202.9 213.6" transform="rotate(-90 40 40)"/>
-          <text x="40" y="44" text-anchor="middle" font-size="13" font-weight="700" fill="currentColor">95%</text>
+          <text x="40" y="44" text-anchor="middle" font-size="13" font-weight="700" fill="currentColor">{{ qualityPercent }}</text>
         </svg>
         <div class="dash-legend">
           <span class="dash-legend-item"><span class="dash-dot" style="background:#fff;border:1px solid var(--divider);"></span>未连接</span>
-          <span class="dash-legend-item"><span class="dash-dot" style="background:var(--success);"></span>延迟</span>
-          <span class="dash-legend-item"><span class="dash-dot" style="background:var(--error);"></span>丢包</span>
+          <span class="dash-legend-item"><span class="dash-dot" style="background:var(--success);"></span>在线率</span>
         </div>
       </div>
       <div class="dash-footer">
-        <span>延迟 <strong>15 ms</strong></span>
-        <span>丢包 <strong>0.00%</strong> <svg width="12" height="12" viewBox="0 0 24 24" fill="var(--error)" style="vertical-align:-2px;"><path d="M12 2L1 21h22L12 2zm1 14h-2v-2h2v2zm0-4h-2V7h2v5z"/></svg></span>
+        <span>延迟 <strong>{{ latency }}</strong></span>
+        <span>丢包 <strong>0.00%</strong></span>
       </div>
     </div>
 
@@ -472,7 +475,7 @@ export function renderDashboardHtml(data) {
         <svg viewBox="0 0 80 80" width="80" height="80" style="flex-shrink:0;">
           <circle cx="40" cy="40" r="30" fill="none" stroke="#2196F3" stroke-width="12" stroke-dasharray="141.4 188.5" transform="rotate(-90 40 40)"/>
           <circle cx="40" cy="40" r="30" fill="none" stroke="#00E5FF" stroke-width="12" stroke-dasharray="47.1 188.5" stroke-dashoffset="-141.4" transform="rotate(-90 40 40)"/>
-          <text x="40" y="44" text-anchor="middle" font-size="11" font-weight="700" fill="currentColor">559MB</text>
+          <text x="40" y="44" text-anchor="middle" font-size="11" font-weight="700" fill="currentColor">{{ totalTxText }}</text>
         </svg>
         <div class="dash-legend">
           <span class="dash-legend-item"><span class="dash-dot" style="background:#00E5FF;"></span>上传</span>
@@ -480,8 +483,8 @@ export function renderDashboardHtml(data) {
         </div>
       </div>
       <div class="dash-footer">
-        <span>上传 <strong>91.07 MB</strong></span>
-        <span>下载 <strong>468.35 MB</strong></span>
+        <span>上传 <strong>{{ totalTxText }}</strong></span>
+        <span>下载 <strong>{{ totalRxText }}</strong></span>
       </div>
     </div>
 
@@ -492,7 +495,7 @@ export function renderDashboardHtml(data) {
       </div>
       <div class="dash-card-body">
         <div class="dash-value">{{ profile.deviceName || currentUser }}</div>
-        <div class="dash-sub" style="display:flex;align-items:center;gap:4px;margin-top:6px;">${icon("symmetric", 14)} Symmetric</div>
+        <div class="dash-sub" style="display:flex;align-items:center;gap:4px;margin-top:6px;">${icon("symmetric", 14)} {{ profile.virtualIp || '未分配' }}</div>
       </div>
     </div>
 
@@ -501,8 +504,8 @@ export function renderDashboardHtml(data) {
         <div class="dash-card-title"><span class="dash-icon">${icon("config", 16)}</span>当前配置</div>
       </div>
       <div class="dash-card-body">
-        <div class="dash-value">{{ profile.deviceName || currentUser }}</div>
-        <div class="dash-sub" style="display:flex;align-items:center;gap:4px;margin-top:6px;">${icon("lock", 14)} 组网密码已设置</div>
+        <div class="dash-value">{{ joinedCount }} 个房间</div>
+        <div class="dash-sub" style="display:flex;align-items:center;gap:4px;margin-top:6px;">${icon("lock", 14)} 中继{{ relayDisabled ? '已禁止' : '已启用' }}</div>
       </div>
     </div>
 
@@ -524,7 +527,7 @@ export function renderDashboardHtml(data) {
       </div>
       <div class="dash-card-body">
         <div class="dash-value mono">{{ profile.virtualIp || '未分配' }}</div>
-        <div class="dash-sub">用户静态指定</div>
+        <div class="dash-sub">账户资料指定</div>
       </div>
     </div>
 
@@ -552,35 +555,110 @@ export function renderDashboardHtml(data) {
 
   const script = `
 const { createApp } = Vue;
-const CURRENT_KEY = 'vnts2_current_user';
-const USERS_KEY = 'vnts2_users';
-function loadUsers() { try { return JSON.parse(localStorage.getItem(USERS_KEY) || '{}'); } catch (e) { return {}; } }
-const current = localStorage.getItem(CURRENT_KEY) || '';
-if (!current) { location.href = '/login?redirect=/dashboard'; }
-const users = loadUsers();
-const profile = users[current] || { deviceName: current, virtualIp: '', createdAt: '-' };
+// 清理旧版 localStorage 状态，避免与新账户体系混用
+try {
+  localStorage.removeItem('vnts2_users');
+  localStorage.removeItem('vnts2_current_user');
+  localStorage.removeItem('vnts2_joined_rooms');
+} catch (e) {}
+function fmtBytes(n) {
+  n = n || 0;
+  if (n < 1024) return n + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < units.length - 1);
+  return n.toFixed(n >= 100 ? 0 : 2) + ' ' + units[i];
+}
+async function fetchJson(url) {
+  const res = await fetch(url, { cache: 'no-store' });
+  if (res.status === 401) { location.href = '/login?redirect=' + encodeURIComponent(location.pathname); return null; }
+  return res.json();
+}
 createApp({
   data() {
     return {
-      currentUser: current,
-      profile: { ...profile },
+      currentUser: '',
+      profile: { deviceName: '', virtualIp: '', createdAt: '-' },
       status: ${jsonScript(status)},
       rooms: ${jsonScript(rooms)},
       serverVersion: ${jsonScript(data.serverVersion || "")},
       startTime: ${jsonScript(data.startTime || "")},
       runDuration: ${jsonScript(data.runDuration || "")},
-      relayServer: 'wss://' + window.location.host
+      relayServer: 'wss://' + window.location.host,
+      relayDisabled: ${jsonScript(relayDisabled)},
+      joinedCount: 0,
+      uploadSpeed: '0.00 KB/s',
+      downloadSpeed: '0.00 KB/s',
+      totalTxText: '0 B',
+      totalRxText: '0 B',
+      qualityPercent: '0%',
+      latency: '-',
+      onlineDevices: 0,
+      offlineDevices: 0,
+      _prev: null,
+      _prevTime: 0
     };
-  },
-  computed: {
-    onlineDevices() { return this.status['在线客户端'] || 0; },
-    offlineDevices() { return this.status['离线客户端'] || 0; }
   },
   methods: {
     copy(text) {
       if (!text) return;
       navigator.clipboard.writeText(text).then(() => alert('已复制：' + text));
+    },
+    async tick() {
+      const snap = await fetchJson('/dashboard?format=json');
+      if (!snap) return;
+      this.status = snap.status || this.status;
+      this.rooms = snap.rooms || this.rooms;
+      const joined = snap.joinedRooms || [];
+      this.joinedCount = joined.length;
+      if (snap.config && snap.config.environment) {
+        this.relayDisabled = snap.config.environment.DISABLE_RELAY === '1';
+      }
+      let tx = 0, rx = 0, online = 0, total = 0;
+      for (const room of joined) {
+        for (const d of room.devices || []) {
+          tx += d.txBytes || 0;
+          rx += d.rxBytes || 0;
+          total++;
+          if (d.online) online++;
+        }
+      }
+      const now = Date.now();
+      if (this._prev && this._prevTime) {
+        const dt = (now - this._prevTime) / 1000;
+        if (dt > 0) {
+          this.uploadSpeed = (Math.max(0, tx - this._prev.tx) / dt / 1024).toFixed(2) + ' KB/s';
+          this.downloadSpeed = (Math.max(0, rx - this._prev.rx) / dt / 1024).toFixed(2) + ' KB/s';
+        }
+      }
+      this._prev = { tx, rx };
+      this._prevTime = now;
+      this.totalTxText = fmtBytes(tx);
+      this.totalRxText = fmtBytes(rx);
+      this.qualityPercent = total ? Math.round((online / total) * 100) + '%' : '0%';
+      this.onlineDevices = this.status['在线客户端'] || 0;
+      this.offlineDevices = this.status['离线客户端'] || 0;
+    },
+    async measureLatency() {
+      try {
+        const t0 = performance.now();
+        await fetch('/health', { method: 'HEAD', cache: 'no-store' });
+        this.latency = Math.max(1, Math.round(performance.now() - t0)) + ' ms';
+      } catch (e) {}
     }
+  },
+  async mounted() {
+    const me = await fetchJson('/api/auth/me');
+    if (!me) return;
+    this.currentUser = me.username || '';
+    this.profile = {
+      deviceName: me.deviceName || me.username || '',
+      virtualIp: me.virtualIp || '',
+      createdAt: me.createdAt || '-'
+    };
+    await this.tick();
+    setInterval(() => this.tick(), 5000);
+    this.measureLatency();
   }
 }).mount('#app');
 `;
@@ -589,7 +667,7 @@ createApp({
 }
 
 /* ============================================================
- * 房间列表（需登录；localStorage 记录已加入房间）
+ * 房间列表（需登录；账户级已加入房间，跨浏览器共享）
  * ============================================================ */
 export function renderRoomListHtml(data) {
   const rooms = data.rooms || [];
@@ -613,12 +691,12 @@ export function renderRoomListHtml(data) {
             <div class="dash-sub">设备：{{ room.deviceCount }} 台（{{ room.onlineDevices }} 在线 / {{ room.deviceCount - room.onlineDevices }} 离线）</div>
           </div>
           <div style="display:flex;gap:8px;margin-top:12px;flex-wrap:wrap;">
-            <button class="btn btn-sm" :class="isJoined(room.networkCode) ? 'btn-primary' : 'btn-ghost'" @click="toggleJoin(room)">{{ isJoined(room.networkCode) ? '✓ 已加入' : '加入' }}</button>
+            <button class="btn btn-sm" :class="isJoined(room.networkCode) ? 'btn-primary' : 'btn-ghost'" :disabled="busy" @click="toggleJoin(room)">{{ isJoined(room.networkCode) ? '✓ 已加入' : '加入' }}</button>
             <a class="btn btn-ghost btn-sm" :href="'/room?network=' + encodeURIComponent(room.networkCode) + '&gateway=' + encodeURIComponent(room.gateway)">查看设备</a>
           </div>
         </div>
       </div>
-      <div v-else class="empty-state">
+      <div v-else-if="!loading" class="empty-state">
         <div class="empty-icon">🚪</div>
         <div>暂无房间，请联系管理员添加房间</div>
       </div>
@@ -628,24 +706,49 @@ export function renderRoomListHtml(data) {
 
   const script = `
 const { createApp } = Vue;
-const ROOMS_KEY = 'vnts2_joined_rooms';
-function loadJoined() { try { return JSON.parse(localStorage.getItem(ROOMS_KEY) || '[]'); } catch (e) { return []; } }
-function saveJoined(list) { localStorage.setItem(ROOMS_KEY, JSON.stringify(list)); }
+try { localStorage.removeItem('vnts2_joined_rooms'); } catch (e) {}
+async function loadMe() {
+  const res = await fetch('/api/auth/me');
+  if (res.status === 401) { location.href = '/login?redirect=' + encodeURIComponent(location.pathname); return null; }
+  const data = await res.json();
+  return data.ok ? data : null;
+}
 createApp({
   data() {
     return {
       rooms: ${jsonScript(rooms)},
-      joined: loadJoined()
+      joined: [],
+      loading: true,
+      busy: false
     };
   },
   methods: {
     isJoined(code) { return this.joined.includes(code); },
-    toggleJoin(room) {
+    async toggleJoin(room) {
       const idx = this.joined.indexOf(room.networkCode);
-      if (idx >= 0) { this.joined.splice(idx, 1); }
-      else { this.joined.push(room.networkCode); }
-      saveJoined(this.joined);
+      const isJoin = idx < 0;
+      this.busy = true;
+      try {
+        const res = await fetch('/api/rooms/' + (isJoin ? 'join' : 'leave'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ networkCode: room.networkCode })
+        });
+        if (res.status === 401) { location.href = '/login?redirect=' + encodeURIComponent(location.pathname); return; }
+        const data = await res.json();
+        if (data.ok) { this.joined = data.joinedRooms || []; }
+        else { alert(data.error || '操作失败'); }
+      } catch (e) {
+        alert('网络错误，请重试');
+      } finally {
+        this.busy = false;
+      }
     }
+  },
+  async mounted() {
+    const me = await loadMe();
+    if (me) { this.joined = me.joinedRooms || []; }
+    this.loading = false;
   }
 }).mount('#app');
 `;
@@ -711,7 +814,7 @@ createApp({
   data() {
     return {
       form: { network: '', gateway: '' },
-      message: ${message ? JSON.stringify(message) : "''"}
+      message: ${message ? jsonScript(message) : "''"}
     };
   },
   methods: {
@@ -868,7 +971,7 @@ createApp({
   data() {
     return {
       form: { token: '' },
-      message: ${message ? JSON.stringify(message) : "''"}
+      message: ${message ? jsonScript(message) : "''"}
     };
   },
   methods: {
@@ -995,7 +1098,7 @@ createApp({
       form: { password: saved },
       rememberPwd: !!saved,
       inputType: 'password',
-      message: ${errorMessage ? JSON.stringify(errorMessage) : "''"}
+      message: ${errorMessage ? jsonScript(errorMessage) : "''"}
     };
   },
   methods: {
@@ -1184,7 +1287,7 @@ createApp({
   data() {
     return {
       form: { password: '' },
-      message: ${message ? JSON.stringify(message) : "''"}
+      message: ${message ? jsonScript(message) : "''"}
     };
   },
   methods: {
@@ -1507,7 +1610,7 @@ createApp({
   data() {
     return {
       form: { password: '' },
-      message: ${message ? JSON.stringify(message) : "''"}
+      message: ${message ? jsonScript(message) : "''"}
     };
   },
   methods: {
@@ -1599,145 +1702,157 @@ export function renderConfigHtml(snapshot) {
 
   const script = `
 const { createApp } = Vue;
-const CURRENT_KEY = 'vnts2_current_user';
-const USERS_KEY = 'vnts2_users';
-const ROOMS_KEY = 'vnts2_joined_rooms';
-function loadUsers() { try { return JSON.parse(localStorage.getItem(USERS_KEY) || '{}'); } catch (e) { return {}; } }
-function loadJoined() { try { return JSON.parse(localStorage.getItem(ROOMS_KEY) || '[]'); } catch (e) { return []; } }
-const current = localStorage.getItem(CURRENT_KEY) || '';
-if (!current) { location.href = '/login?redirect=/config'; }
-// 按已加入房间重载页面，服务端才会附带这些房间的组网密码（避免未登录/未加入时泄露密码）
-const joinedKey = loadJoined().join(',');
-const currentRooms = new URLSearchParams(location.search).get('rooms') || '';
-if (joinedKey !== currentRooms) {
-  location.replace('/config' + (joinedKey ? '?rooms=' + encodeURIComponent(joinedKey) : ''));
+// 清理旧版 localStorage 状态，避免与新账户体系混用
+try {
+  localStorage.removeItem('vnts2_users');
+  localStorage.removeItem('vnts2_current_user');
+  localStorage.removeItem('vnts2_joined_rooms');
+} catch (e) {}
+async function loadMe() {
+  const res = await fetch('/api/auth/me');
+  if (res.status === 401) { location.href = '/login?redirect=/config'; return null; }
+  const data = await res.json();
+  return data.ok ? data : null;
 }
-const users = loadUsers();
-const profile = users[current] || { deviceName: current, virtualIp: '', createdAt: '-' };
-const allRooms = ${jsonScript(rooms)};
-createApp({
-  data() {
-    return {
-      currentUser: current,
-      allRooms: allRooms,
-      joinedCodes: loadJoined(),
-      form: {
-        name: profile.deviceName || current,
-        device_id: profile.deviceId || '',
-        ip: profile.virtualIp || ''
-      },
-      manualCode: '',
-      notice: ''
-    };
-  },
-  computed: {
-    joinedRooms() {
-      return this.joinedCodes
-        .map(code => this.allRooms.find(r => r.networkCode === code) || { networkCode: code, cidr: '手动添加', gateway: '', deviceCount: 0 })
-        .filter(r => r.networkCode);
-    }
-  },
-  methods: {
-    generateId() {
-      this.form.device_id = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-        const r = Math.random() * 16 | 0;
-        const v = c === 'x' ? r : (r & 0x3 | 0x8);
-        return v.toString(16);
-      });
-    },
-    addManual() {
-      const code = this.manualCode.trim();
-      if (!code) { this.notice = '请输入网络编号'; return; }
-      if (!this.joinedCodes.includes(code)) {
-        this.joinedCodes.push(code);
-        localStorage.setItem(ROOMS_KEY, JSON.stringify(this.joinedCodes));
-        // 重新按最新已加入房间加载，获取该房间的管理员密码（如果存在）
-        location.href = '/config?rooms=' + encodeURIComponent(this.joinedCodes.join(','));
-        return;
-      }
-      this.manualCode = '';
-      this.notice = '已添加网络编号：' + code;
-    },
-    configValues(room) {
-      const f = this.form;
-      const serverAddress = 'wss://' + window.location.host;
-      const name = (f.name || 'vnt2').trim();
-      const roomPassword = room.password || '';
-      const items = [];
-      const push = (key, value, comment) => {
-        if (value !== undefined && value !== null && String(value).trim() !== '') items.push({ key, value: String(value).trim(), comment: comment || '' });
-      };
-      push('token', room.networkCode, '组网编号');
-      if (f.ip) push('ip', f.ip, '本机虚拟IP');
-      if (f.device_id) push('device_id', f.device_id, '设备ID');
-      push('name', name, '设备名称');
-      push('server_address', serverAddress, '注册和中继服务器');
-      if (roomPassword) {
-        push('cipher_model', 'aes_gcm', '加密方式');
-        push('password', roomPassword, '组网密码');
-      }
-      push('mtu', '1420', '虚拟网卡MTU');
-      return items;
-    },
-    buildYaml(room) {
-      return this.configValues(room).map(it => it.comment ? it.key + ': ' + it.value + '   # ' + it.comment : it.key + ': ' + it.value).join('\\n');
-    },
-    buildToml(room) {
-      return this.configValues(room).map(it => {
-        const val = /^[0-9]+$/.test(it.value) ? it.value : JSON.stringify(it.value);
-        return it.comment ? it.key + ' = ' + val + '  # ' + it.comment : it.key + ' = ' + val;
-      }).join('\\n');
-    },
-    buildJson(room) {
-      const f = this.form;
-      return JSON.stringify({
-        config: {
-          itemKey: 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-            const r = Math.random() * 16 | 0;
-            const v = c === 'x' ? r : (r & 0x3 | 0x8);
-            return v.toString(16);
-          }),
-          network_code: room.networkCode,
-          config_name: (f.name || 'vnt2').trim(),
-          ip: f.ip.trim(),
-          server: ['wss://' + window.location.host],
-          device_id: f.device_id.trim(),
-          device_name: (f.name || 'vnt2').trim(),
-          tun_name: 'vnt2',
-          password: (room.password || '').trim(),
-          cert_mode: 'skip',
-          mtu: 1420,
-          no_punch: false,
-          compress: false,
-          rtx: false,
-          fec: false,
-          input: [],
-          output: [],
-          port_mapping: [],
-          no_nat: false,
-          no_tun: false,
-          allow_port_mapping: false,
-          udp_stun: [],
-          tcp_stun: [],
-          tunnel_port: 0,
-          updated_at: ''
-        }
-      }, null, 2);
-    },
-    download(format, room) {
-      let content = '', filename = '', mime = 'text/plain';
-      if (format === 'yaml') { content = this.buildYaml(room); filename = 'vnt_config-' + room.networkCode + '.yaml'; mime = 'text/yaml'; }
-      else if (format === 'toml') { content = this.buildToml(room); filename = 'vnt_config-' + room.networkCode + '.toml'; mime = 'text/plain'; }
-      else { content = this.buildJson(room); filename = 'vnt2_config-' + room.networkCode + '.json'; mime = 'application/json'; }
-      const blob = new Blob([content], { type: mime + ';charset=utf-8;' });
-      const a = document.createElement('a');
-      a.href = URL.createObjectURL(blob);
-      a.download = filename;
-      a.click();
-      URL.revokeObjectURL(a.href);
-    }
+(async () => {
+  const me = await loadMe();
+  if (!me) return;
+  const current = me.username || '';
+  // 按已加入房间重载页面，服务端才会附带这些房间的组网密码（避免未登录/未加入时泄露密码）
+  const joinedKey = (me.joinedRooms || []).join(',');
+  const currentRooms = new URLSearchParams(location.search).get('rooms') || '';
+  if (joinedKey !== currentRooms) {
+    location.replace('/config' + (joinedKey ? '?rooms=' + encodeURIComponent(joinedKey) : ''));
+    return;
   }
-}).mount('#app');
+  const profile = { deviceName: me.deviceName || current, virtualIp: me.virtualIp || '', createdAt: me.createdAt || '-' };
+  const allRooms = ${jsonScript(rooms)};
+  createApp({
+    data() {
+      return {
+        currentUser: current,
+        allRooms: allRooms,
+        joinedCodes: (me.joinedRooms || []).slice(),
+        form: {
+          name: profile.deviceName || current,
+          device_id: profile.deviceId || '',
+          ip: profile.virtualIp || ''
+        },
+        manualCode: '',
+        notice: ''
+      };
+    },
+    computed: {
+      joinedRooms() {
+        return this.joinedCodes
+          .map(code => this.allRooms.find(r => r.networkCode === code) || { networkCode: code, cidr: '手动添加', gateway: '', deviceCount: 0 })
+          .filter(r => r.networkCode);
+      }
+    },
+    methods: {
+      generateId() {
+        this.form.device_id = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+          const r = Math.random() * 16 | 0;
+          const v = c === 'x' ? r : (r & 0x3 | 0x8);
+          return v.toString(16);
+        });
+      },
+      async addManual() {
+        const code = this.manualCode.trim();
+        if (!code) { this.notice = '请输入网络编号'; return; }
+        const res = await fetch('/api/rooms/join', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ networkCode: code })
+        });
+        if (res.status === 401) { location.href = '/login?redirect=/config'; return; }
+        const data = await res.json();
+        if (!data.ok) { this.notice = data.error || '加入失败'; return; }
+        // 重新按最新已加入房间加载，获取该房间的管理员密码（如果存在）
+        this.joinedCodes = data.joinedRooms || [];
+        location.href = '/config?rooms=' + encodeURIComponent(this.joinedCodes.join(','));
+      },
+      configValues(room) {
+        const f = this.form;
+        const serverAddress = 'wss://' + window.location.host;
+        const name = (f.name || 'vnt2').trim();
+        const roomPassword = room.password || '';
+        const items = [];
+        const push = (key, value, comment) => {
+          if (value !== undefined && value !== null && String(value).trim() !== '') items.push({ key, value: String(value).trim(), comment: comment || '' });
+        };
+        push('token', room.networkCode, '组网编号');
+        if (f.ip) push('ip', f.ip, '本机虚拟IP');
+        if (f.device_id) push('device_id', f.device_id, '设备ID');
+        push('name', name, '设备名称');
+        push('server_address', serverAddress, '注册和中继服务器');
+        if (roomPassword) {
+          push('cipher_model', 'aes_gcm', '加密方式');
+          push('password', roomPassword, '组网密码');
+        }
+        push('mtu', '1420', '虚拟网卡MTU');
+        return items;
+      },
+      buildYaml(room) {
+        return this.configValues(room).map(it => it.comment ? it.key + ': ' + it.value + '   # ' + it.comment : it.key + ': ' + it.value).join('\\n');
+      },
+      buildToml(room) {
+        return this.configValues(room).map(it => {
+          const val = /^[0-9]+$/.test(it.value) ? it.value : JSON.stringify(it.value);
+          return it.comment ? it.key + ' = ' + val + '  # ' + it.comment : it.key + ' = ' + val;
+        }).join('\\n');
+      },
+      buildJson(room) {
+        const f = this.form;
+        return JSON.stringify({
+          config: {
+            itemKey: 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+              const r = Math.random() * 16 | 0;
+              const v = c === 'x' ? r : (r & 0x3 | 0x8);
+              return v.toString(16);
+            }),
+            network_code: room.networkCode,
+            config_name: (f.name || 'vnt2').trim(),
+            ip: f.ip.trim(),
+            server: ['wss://' + window.location.host],
+            device_id: f.device_id.trim(),
+            device_name: (f.name || 'vnt2').trim(),
+            tun_name: 'vnt2',
+            password: (room.password || '').trim(),
+            cert_mode: 'skip',
+            mtu: 1420,
+            no_punch: false,
+            compress: false,
+            rtx: false,
+            fec: false,
+            input: [],
+            output: [],
+            port_mapping: [],
+            no_nat: false,
+            no_tun: false,
+            allow_port_mapping: false,
+            udp_stun: [],
+            tcp_stun: [],
+            tunnel_port: 0,
+            updated_at: ''
+          }
+        }, null, 2);
+      },
+      download(format, room) {
+        let content = '', filename = '', mime = 'text/plain';
+        if (format === 'yaml') { content = this.buildYaml(room); filename = 'vnt_config-' + room.networkCode + '.yaml'; mime = 'text/yaml'; }
+        else if (format === 'toml') { content = this.buildToml(room); filename = 'vnt_config-' + room.networkCode + '.toml'; mime = 'text/plain'; }
+        else { content = this.buildJson(room); filename = 'vnt2_config-' + room.networkCode + '.json'; mime = 'application/json'; }
+        const blob = new Blob([content], { type: mime + ';charset=utf-8;' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = filename;
+        a.click();
+        URL.revokeObjectURL(a.href);
+      }
+    }
+  }).mount('#app');
+})();
 `;
 
   return renderShell({ title: "配置", active: "config", content, script });
