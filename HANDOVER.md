@@ -102,20 +102,24 @@ cd test
 
 - `src/worker.js`：新增 `/api/*` 路由转发到 Durable Object。
 - `src/room.js`：
-  - 常量：`ACCOUNTS_KEY`、`SESSION_TTL_MS`（7 天）、`MAX_JOINED_ROOMS`(32)。
-  - 构造函数新增 `this.accounts`（用户名→账户对象）、`this.accountSessions`（token→会话）。
-  - `init()` 从 DO Storage 恢复账户（用户名、PBKDF2 密码哈希+盐、deviceName、virtualIp、createdAt、joinedRooms）。
+  - 常量：`ACCOUNTS_KEY`、`SESSIONS_KEY`、`INVITES_KEY`、`REG_MODE_KEY`、`SESSION_TTL_MS`（7 天）、`MAX_JOINED_ROOMS`(32)。
+  - 构造函数新增 `this.accounts`（用户名→账户对象）、`this.accountSessions`（token→会话）、`this.invites`（邀请码）、`this.registrationMode`（open/invite/closed）。
+  - `init()` 从 DO Storage 恢复账户（用户名、PBKDF2 密码哈希+盐、deviceName、virtualIp、createdAt、joinedRooms）、账户会话（持久化登录态）、邀请码与注册模式。
   - 接口：
-    - `POST /api/auth/login`：注册/登录，PBKDF2(100k, SHA-256) 校验，成功设置 `vnts2_account` HttpOnly Cookie。
+    - `POST /api/auth/register`：注册（受注册模式控制，邀请码模式校验邀请码），成功设置 `vnts2_account` HttpOnly Cookie。
+    - `POST /api/auth/login`：仅登录，PBKDF2(100k, SHA-256) 校验，成功设置 `vnts2_account` HttpOnly Cookie。
     - `GET /api/auth/me`：返回当前账户资料与已加入房间。
+    - `GET /api/auth/config`：返回当前注册模式（open/invite/closed）。
     - `POST /api/auth/logout`：清会话与 Cookie。
     - `POST /api/rooms/join` / `POST /api/rooms/leave`：账户级加入/退出房间（跨浏览器共享）。
-  - `cleanupExpired()` 中调用 `cleanupAccountSessions()` 清理过期会话。
+    - `POST /api/admin/registration`：管理员设置注册模式。
+    - `GET /api/admin/invites` / `POST /api/admin/invites` / `POST /api/admin/invites/disable`：邀请码管理。
+  - `cleanupExpired()` 中调用 `cleanupAccountSessions()` 清理过期会话并持久化。
   - `handleDashboardPage()` 已扩展：当请求带有效账户会话时，`joinedRooms` 返回用户已加入房间的**真实设备流量**（txBytes/rxBytes/online）。
 
 ### 4.2 前端接线（已完成 2026-10-04）
 
-- [x] `ui-pages.js` 的 `renderLoginPage()`：改用 `POST /api/auth/login`（新用户自动注册），移除 localStorage 用户名密码（`vnts2_users`）。
+- [x] `ui-pages.js` 的 `renderLoginPage()`：改用 `POST /api/auth/login`（仅登录），新增 `renderRegisterPage()`（`/register`），移除 localStorage 用户名密码（`vnts2_users`）。
 - [x] `ui-pages.js` 的 `renderRoomListHtml()`：初始化 `GET /api/auth/me` 拉取已加入房间，加入/退出调用 `POST /api/rooms/join|leave`，移除 localStorage。
 - [x] `ui-pages.js` 的 `renderDashboardHtml()`：真实数据接入：
   - 网络速度：轮询 `/dashboard?format=json`（5s 间隔），对 `joinedRooms[].devices[].txBytes/rxBytes` 差分算 KB/s。
@@ -131,17 +135,31 @@ cd test
 
 ### 4.3 设计说明（供后续实现参考）
 
-- 会话 Cookie：`vnts2_account=<uuid>`，`HttpOnly; SameSite=Strict; Path=/; Max-Age=604800`，与服务端 `accountSessions` 内存映射对应（DO 重启后会话失效，用户需重新登录；账户数据已持久化到 `vnts2-accounts`）。
+- 会话 Cookie：`vnts2_account=<uuid>`，`HttpOnly; SameSite=Strict; Path=/; Max-Age=604800`。账户会话持久化到 DO Storage（`vnts2-sessions`），DO 重启后登录态仍有效。
 - 密码：PBKDF2（100000 次，随机 16 字节盐），辅助函数 `pbkdf2Hex()`、`randomHex()` 已加入 `room.js` 底部。
 - 房间密码（组网密码）与账户分离：组网密码仍由管理员在 `/admin` 设置，`/config` 按 3.1 的会话规则发放。
+
+### 4.4 注册与邀请码管理（2026-10-04 新增）
+
+- 登录页 `/login` 与注册页 `/register` 已分离；注册页通过 `GET /api/auth/config` 感知注册模式。
+- 注册模式由管理员控制（`/admin` 页面"注册与邀请码"卡片）：
+  - `open`：开放注册（默认，兼容旧行为）。
+  - `invite`：邀请码注册，注册时必须提供有效邀请码。
+  - `closed`：关闭注册。
+- 环境变量 `REGISTER_MODE=open|invite|closed` 可作为部署默认值；管理员保存后写入 DO Storage（`vnts2-registration-mode`）覆盖默认值。
+- 邀请码：
+  - 管理员生成时可设置可用次数（1-1000）与有效小时数（0=永久）。
+  - 存储于 DO Storage（`vnts2-invites`），字段：`code / remaining / maxUses / expiresAt / createdAt / disabled`。
+  - 每次注册消耗一次；次数用完自动停用；可手动停用。
+  - 邀请码为 8 位随机字符（去掉易混淆字符）。
 
 ---
 
 ## 5. 测试
 
 - 现有 `test/protocol.test.js`（9 个）：协议编解码、IP 分配、protobuf 安全边界。
-- 新增 `test/ui.test.js`（8 个）：4 个登录页对 `</script>` 注入的转义 + 无 message 渲染。
-- 当前 `npm test`：17/17 通过。
+- `test/ui.test.js`（10 个）：4 个登录页对 `</script>` 注入的转义 + 无 message 渲染、注册页包含注册接口与模式查询、登录页不再包含自动注册逻辑。
+- 当前 `npm test`：19/19 通过。
 - 注意：`test/ui.test.js` 断言断言字符串为 `\u003c/script>`（jsonScript 只转义 `<`）。
 
 ---

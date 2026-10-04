@@ -26,7 +26,7 @@ export default {
         return Response.redirect(new URL("/dashboard", url.origin).toString(), 302);
       }
 
-      if (url.pathname === "/health" || url.pathname === "/me" || url.pathname === "/login" || url.pathname === "/test" || url.pathname === "/room" || url.pathname === "/settings" || url.pathname === "/config" || url.pathname === "/dashboard" || url.pathname === "/about") {
+      if (url.pathname === "/health" || url.pathname === "/me" || url.pathname === "/login" || url.pathname === "/register" || url.pathname === "/test" || url.pathname === "/room" || url.pathname === "/settings" || url.pathname === "/config" || url.pathname === "/dashboard" || url.pathname === "/about") {
         return await stub.fetch(request);
       }
 

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { renderLoginHtml, renderPeerLoginHtml, renderAdminLoginHtml, renderLogLoginHtml } from "../src/ui-pages.js";
+import { renderLoginHtml, renderPeerLoginHtml, renderAdminLoginHtml, renderLogLoginHtml, renderRegisterPage, renderLoginPage } from "../src/ui-pages.js";
 
 const PAYLOAD = '</script><script>alert(1)</script>';
 
@@ -22,3 +22,15 @@ for (const [name, render] of [
     assert.ok(html.includes("message: ''"));
   });
 }
+
+test("注册页包含注册接口与注册模式查询", () => {
+  const html = renderRegisterPage();
+  assert.ok(html.includes("/api/auth/register"), "注册页应调用注册接口");
+  assert.ok(html.includes("/api/auth/config"), "注册页应查询注册模式");
+});
+
+test("登录页不再包含自动注册逻辑", () => {
+  const html = renderLoginPage();
+  assert.ok(!html.includes("/api/auth/register"), "登录页不应调用注册接口");
+  assert.ok(html.includes("/register"), "登录页应提供注册入口链接");
+});

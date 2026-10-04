@@ -14,15 +14,21 @@ import {
   parseSelectiveBroadcast,
   readPacket
 } from "./protocol.js";
-import { contains, defaultNetworkConfig, intToIp, isNetworkAllowed, networkConfigFromClientIp, parseNetworks } from "./ip.js";
+import { contains, defaultNetworkConfig, intToIp, networkConfigFromClientIp, parseNetworks } from "./ip.js";
 import { SERVER_VERSION as GEN_VERSION } from "./version.js";
 import { setUiVersion } from "./ui.js";
-import { renderHealthHtml, renderLoginPage, renderLoginHtml, renderRoomHtml, renderRoomListHtml, renderPeerLoginHtml, renderPeerHtml, renderLogLoginHtml, renderLogHtml, renderSettingsHtml, renderAdminLoginHtml, renderAdminHtml, renderConfigHtml, renderDashboardHtml, renderAboutPage } from "./ui-pages.js";
+import { renderHealthHtml, renderLoginPage, renderRegisterPage, renderLoginHtml, renderRoomHtml, renderRoomListHtml, renderPeerLoginHtml, renderPeerHtml, renderLogLoginHtml, renderLogHtml, renderSettingsHtml, renderAdminLoginHtml, renderAdminHtml, renderConfigHtml, renderDashboardHtml, renderAboutPage } from "./ui-pages.js";
 
 const REG_NORMAL = 0;
 const REG_PRE_REGISTER = 1;
 const STORAGE_KEY = "vnts2-state";
 const ACCOUNTS_KEY = "vnts2-accounts";
+const SESSIONS_KEY = "vnts2-sessions";
+const INVITES_KEY = "vnts2-invites";
+const REG_MODE_KEY = "vnts2-registration-mode";
+const REG_MODE_OPEN = "open";
+const REG_MODE_INVITE = "invite";
+const REG_MODE_CLOSED = "closed";
 const MAX_MESSAGE_BYTES = 1024 * 1024;
 const MAX_SESSIONS = 1024;
 const MAX_NETWORKS = 1024;
@@ -42,9 +48,14 @@ export class Vnts2Room {
       this.allowedNetworks = new Set(["__invalid_network_configuration__"]);
       this.configErrors.push(`NETWORKS 配置无效：${errorMessage(error)}`);
     }
+    // NETWORKS 为空表示允许任意网络编号；管理员添加的房间只用于展示/预置，
+    // 不应改变"允许任意"的语义（否则添加一个房间后所有未列出的网络都会被拒绝）。
+    this.allowAllNetworks = this.allowedNetworks.size === 0;
     this.networks = new Map();
     this.sessions = new Map();
     this.accountSessions = new Map();
+    this.invites = new Map();
+    this.registrationMode = normalizeRegistrationMode(env.REGISTER_MODE);
     this.nextSessionId = 1;
     this.accounts = new Map();
     this.initialized = false;
@@ -91,6 +102,7 @@ export class Vnts2Room {
       if (url.pathname === "/dashboard") return await this.handleDashboardPage(request, url);
       if (url.pathname === "/about") return htmlResponse(renderAboutPage());
       if (url.pathname === "/login") return htmlResponse(renderLoginPage());
+      if (url.pathname === "/register") return htmlResponse(renderRegisterPage());
       if (url.pathname === "/room") return await this.handleRoomPage(request, url);
       if (url.pathname === "/log") return await this.handleLogPage(request, url);
       if (url.pathname === "/log/clear") return await this.handleLogClear(request, url);
@@ -141,7 +153,7 @@ export class Vnts2Room {
       for (const [code, value] of Object.entries(saved.networks)) {
         try {
           if (this.networks.size >= MAX_NETWORKS || restoredDevices >= MAX_STORED_DEVICES) break;
-          if (!code || code.length > 32 || !isNetworkAllowed(this.allowedNetworks, code) || !value || typeof value !== "object") continue;
+          if (!code || code.length > 32 || !this.isNetworkAllowedByConfig(code) || !value || typeof value !== "object") continue;
           const net = this.ensureNetwork(code, storedNetworkConfig(value.config, this.defaultGatewayIp));
           net.dataVersion = safeNonNegativeInteger(value.dataVersion);
           for (const record of Array.isArray(value.devices) ? value.devices : []) {
@@ -186,6 +198,48 @@ export class Vnts2Room {
       }
     } catch (error) {
       this.reportError("恢复账户数据失败", error);
+    }
+    // 恢复账户会话（持久化登录态，DO 重启后 Cookie 仍有效）
+    try {
+      const savedSessions = await this.state.storage.get(SESSIONS_KEY);
+      if (savedSessions && typeof savedSessions === "object" && !Array.isArray(savedSessions)) {
+        for (const [token, s] of Object.entries(savedSessions)) {
+          if (token && s && typeof s.username === "string" && typeof s.expires === "number" && s.expires > Date.now()) {
+            this.accountSessions.set(token, { username: s.username, expires: s.expires });
+          }
+        }
+      }
+    } catch (error) {
+      this.reportError("恢复账户会话失败", error);
+    }
+    // 恢复注册模式（管理员设置优先于环境变量）
+    try {
+      const savedMode = await this.state.storage.get(REG_MODE_KEY);
+      if (savedMode === REG_MODE_OPEN || savedMode === REG_MODE_INVITE || savedMode === REG_MODE_CLOSED) {
+        this.registrationMode = savedMode;
+      }
+    } catch (error) {
+      this.reportError("恢复注册模式失败", error);
+    }
+    // 恢复邀请码
+    try {
+      const savedInvites = await this.state.storage.get(INVITES_KEY);
+      if (savedInvites && typeof savedInvites === "object" && !Array.isArray(savedInvites)) {
+        for (const [code, inv] of Object.entries(savedInvites)) {
+          if (code && inv && typeof inv.remaining === "number") {
+            this.invites.set(code, {
+              code,
+              remaining: inv.remaining,
+              maxUses: inv.maxUses || inv.remaining,
+              expiresAt: inv.expiresAt || 0,
+              createdAt: inv.createdAt || "",
+              disabled: !!inv.disabled
+            });
+          }
+        }
+      }
+    } catch (error) {
+      this.reportError("恢复邀请码失败", error);
     }
     // 设置 UI 显示的服务端版本
     setUiVersion(this.serverVersion);
@@ -273,7 +327,7 @@ export class Vnts2Room {
     if (!req.reg) throw new Error("首包必须是注册请求");
     const reg = req.reg;
     this.validateReg(reg);
-    if (!isNetworkAllowed(this.allowedNetworks, reg.networkCode)) {
+    if (!this.isNetworkAllowedByConfig(reg.networkCode)) {
       throw new Error(`network_code '${reg.networkCode}' is not allowed by server configuration or database`);
     }
 
@@ -717,7 +771,7 @@ export class Vnts2Room {
         online = true;
         const body = parseServerMessage(await readResponseBytes(res));
         for (const network of body.clientInfoRes?.networks || []) {
-          if (!isNetworkAllowed(this.allowedNetworks, network.networkCode)) continue;
+          if (!this.isNetworkAllowedByConfig(network.networkCode)) continue;
           const list = next.get(network.networkCode) || [];
           for (const client of network.clients || []) {
             list.push({ ip: client.ip >>> 0, latencyMs: client.latencyMs || 10, online: true, remotePeer: peer });
@@ -733,7 +787,7 @@ export class Vnts2Room {
     const signature = JSON.stringify(Array.from(next.entries()).map(([code, list]) => [code, list.map((c) => [c.ip, c.online, c.dataVersion || 0, c.remotePeer]).sort()]).sort());
     if (signature !== this.peerClientCacheSignature) {
       for (const code of next.keys()) {
-        if (!isNetworkAllowed(this.allowedNetworks, code)) continue;
+        if (!this.isNetworkAllowedByConfig(code)) continue;
         const net = this.ensureNetwork(code);
         net.dataVersion += 1;
       }
@@ -840,7 +894,7 @@ export class Vnts2Room {
         this.logInfo(`未注册会话超时回收 会话=${session.id} 来源=${session.remote || "未知"}`);
       }
     }
-    this.cleanupAccountSessions();
+    await this.cleanupAccountSessions();
     for (const [code, net] of this.networks.entries()) {
       for (const [deviceId, device] of Array.from(net.devices.entries())) {
         if (!device.online && device.disconnectTime && now - device.disconnectTime > this.leaseDurationMs) {
@@ -1288,7 +1342,8 @@ export class Vnts2Room {
       })),
       startTime: this.getStartTimeBeijing(),
       runDuration: this.getRunningDuration(),
-      serverVersion: this.serverVersion
+      serverVersion: this.serverVersion,
+      registrationMode: this.registrationMode
     };
 
     if (url.pathname === "/admin/config") {
@@ -1370,14 +1425,17 @@ export class Vnts2Room {
     );
     // 安全：组网密码属于敏感凭据，必须校验会话后才发放——
     // 管理员会话可获取全部房间密码；普通用户需持有对应房间的会话 Cookie
-    // （由 /room 认证成功后种下 network_code + gateway_ip）。
+    // （由 /room 认证成功后种下 network_code + gateway_ip），
+    // 或已登录账户且已加入该房间（账户级授权，跨浏览器共享）。
     const sessionCookie = parseCookies(request.headers.get("Cookie") || "");
     const isAdminSession = !!this.adminPasswordHash && sessionCookie.vnts2_session === this.adminPasswordHash;
+    const accountUser = this.currentUser(request);
+    const accountJoinedRooms = accountUser ? new Set(accountUser.joinedRooms || []) : new Set();
     const pageData = {
       ...snapshot,
       networks: snapshot.networks.map((r) => ({
         ...r,
-        password: requestedRooms.has(r.networkCode) && (isAdminSession || this.hasRoomSession(sessionCookie, r.networkCode))
+        password: requestedRooms.has(r.networkCode) && (isAdminSession || this.hasRoomSession(sessionCookie, r.networkCode) || accountJoinedRooms.has(r.networkCode))
           ? this.networkPasswords.get(r.networkCode) || ""
           : ""
       }))
@@ -1393,17 +1451,28 @@ export class Vnts2Room {
     return gateway === intToIp(cfg.gateway);
   }
 
+  /** 网络编号是否允许：NETWORKS 为空（未配置白名单）时允许任意，否则仅允许配置/管理员添加的房间 */
+  isNetworkAllowedByConfig(code) {
+    return this.allowAllNetworks || this.allowedNetworks.has(code);
+  }
+
   /* ============================================================
    * 服务端账户与会话（跨浏览器共享登录态与已加入房间）
    * ============================================================ */
 
   /** 统一处理 /api/* 请求 */
   async handleApiRequest(request, url) {
+    if (url.pathname === "/api/auth/register") return this.handleApiRegister(request);
     if (url.pathname === "/api/auth/login") return this.handleApiLogin(request);
     if (url.pathname === "/api/auth/me") return this.handleApiMe(request);
     if (url.pathname === "/api/auth/logout") return this.handleApiLogout(request);
+    if (url.pathname === "/api/auth/config") return this.handleApiAuthConfig(request);
     if (url.pathname === "/api/rooms/join") return this.handleApiJoin(request, true);
     if (url.pathname === "/api/rooms/leave") return this.handleApiJoin(request, false);
+    if (url.pathname === "/api/admin/registration" && request.method === "POST") return this.handleAdminSetRegistration(request);
+    if (url.pathname === "/api/admin/invites" && request.method === "GET") return this.handleAdminListInvites(request);
+    if (url.pathname === "/api/admin/invites" && request.method === "POST") return this.handleAdminCreateInvite(request);
+    if (url.pathname === "/api/admin/invites/disable" && request.method === "POST") return this.handleAdminDisableInvite(request);
     return Response.json({ error: "未知接口" }, { status: 404 });
   }
 
@@ -1428,29 +1497,152 @@ export class Vnts2Room {
     const password = String(body?.password || "");
     if (!username || username.length > 64) return Response.json({ error: "用户名不能为空或过长" }, { status: 400 });
     if (!password || password.length > 256) return Response.json({ error: "密码不能为空或过长" }, { status: 400 });
-    let user = this.accounts.get(username);
-    if (!user) {
-      const salt = randomHex(16);
-      user = {
-        passwordHash: await pbkdf2Hex(password, salt),
-        passwordSalt: salt,
-        deviceName: username,
-        virtualIp: "",
-        createdAt: toBeijingTime(new Date()),
-        joinedRooms: []
-      };
-      this.accounts.set(username, user);
-      await this.saveAccounts();
-      this.logInfo(`注册账户 用户名=${username}`);
-    } else {
-      const hash = await pbkdf2Hex(password, user.passwordSalt);
-      if (hash !== user.passwordHash) return Response.json({ error: "密码不正确" }, { status: 401 });
-    }
+    const user = this.accounts.get(username);
+    if (!user) return Response.json({ error: "用户不存在" }, { status: 401 });
+    const hash = await pbkdf2Hex(password, user.passwordSalt);
+    if (hash !== user.passwordHash) return Response.json({ error: "密码不正确" }, { status: 401 });
     const token = crypto.randomUUID();
     this.accountSessions.set(token, { username, expires: Date.now() + SESSION_TTL_MS });
+    await this.saveAccountSessions();
     const res = Response.json({ ok: true, username, joinedRooms: user.joinedRooms });
     res.headers.append("Set-Cookie", `vnts2_account=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`);
     return res;
+  }
+
+  /** 注册新账户：注册模式由管理员控制（开放 / 邀请码 / 关闭） */
+  async handleApiRegister(request) {
+    let body = null;
+    try {
+      body = await request.json();
+    } catch {}
+    const username = String(body?.username || "").trim();
+    const password = String(body?.password || "");
+    const inviteCode = String(body?.inviteCode || "").trim();
+    if (!username || username.length > 64) return Response.json({ error: "用户名不能为空或过长" }, { status: 400 });
+    if (password.length < 6 || password.length > 256) return Response.json({ error: "密码长度需为 6-256 位" }, { status: 400 });
+    if (this.accounts.has(username)) return Response.json({ error: "用户名已存在" }, { status: 409 });
+    if (this.registrationMode === REG_MODE_CLOSED) return Response.json({ error: "当前未开放注册" }, { status: 403 });
+    if (this.registrationMode === REG_MODE_INVITE) {
+      if (!inviteCode) return Response.json({ error: "需要邀请码" }, { status: 400 });
+      const consumed = await this.consumeInvite(inviteCode);
+      if (!consumed) return Response.json({ error: "邀请码无效或已用完" }, { status: 400 });
+    }
+    const salt = randomHex(16);
+    const user = {
+      passwordHash: await pbkdf2Hex(password, salt),
+      passwordSalt: salt,
+      deviceName: username,
+      virtualIp: "",
+      createdAt: toBeijingTime(new Date()),
+      joinedRooms: []
+    };
+    this.accounts.set(username, user);
+    await this.saveAccounts();
+    this.logInfo(`注册账户 用户名=${username} 方式=${this.registrationMode === REG_MODE_INVITE ? "邀请码" : "开放"}`);
+    const token = crypto.randomUUID();
+    this.accountSessions.set(token, { username, expires: Date.now() + SESSION_TTL_MS });
+    await this.saveAccountSessions();
+    const res = Response.json({ ok: true, username, joinedRooms: [] });
+    res.headers.append("Set-Cookie", `vnts2_account=${token}; Path=/; HttpOnly; SameSite=Strict; Max-Age=${Math.floor(SESSION_TTL_MS / 1000)}`);
+    return res;
+  }
+
+  /** 返回当前注册模式，供注册页判断是否显示邀请码 */
+  handleApiAuthConfig(request) {
+    return Response.json({
+      ok: true,
+      registrationMode: this.registrationMode,
+      inviteRequired: this.registrationMode === REG_MODE_INVITE,
+      registrationClosed: this.registrationMode === REG_MODE_CLOSED
+    });
+  }
+
+  /** 校验并消耗一个邀请码；无效返回 null */
+  async consumeInvite(code) {
+    const invite = this.invites.get(code);
+    if (!invite || invite.disabled) return null;
+    if (invite.expiresAt && Date.now() > invite.expiresAt) return null;
+    if (invite.remaining <= 0) return null;
+    invite.remaining -= 1;
+    if (invite.remaining <= 0) invite.disabled = true;
+    await this.saveInvites();
+    return invite;
+  }
+
+  /** 持久化邀请码到 DO Storage */
+  async saveInvites() {
+    const obj = {};
+    for (const [code, inv] of this.invites.entries()) {
+      obj[code] = {
+        remaining: inv.remaining,
+        maxUses: inv.maxUses,
+        expiresAt: inv.expiresAt,
+        createdAt: inv.createdAt,
+        disabled: inv.disabled
+      };
+    }
+    await this.state.storage.put(INVITES_KEY, obj);
+  }
+
+  /** 管理员会话校验（/api/admin/* 专用） */
+  async requireAdmin(request) {
+    const sessionCookie = parseCookies(request.headers.get("Cookie") || "");
+    return !!this.adminPasswordHash && sessionCookie.vnts2_session === this.adminPasswordHash;
+  }
+
+  async handleAdminSetRegistration(request) {
+    if (!await this.requireAdmin(request)) return Response.json({ error: "未授权" }, { status: 401 });
+    let body = null;
+    try { body = await request.json(); } catch {}
+    const mode = String(body?.mode || "").trim();
+    if (mode !== REG_MODE_OPEN && mode !== REG_MODE_INVITE && mode !== REG_MODE_CLOSED) {
+      return Response.json({ error: "注册模式无效" }, { status: 400 });
+    }
+    this.registrationMode = mode;
+    await this.state.storage.put(REG_MODE_KEY, mode);
+    this.logInfo(`管理员设置注册模式=${mode}`);
+    return Response.json({ ok: true, registrationMode: mode });
+  }
+
+  async handleAdminListInvites(request) {
+    if (!await this.requireAdmin(request)) return Response.json({ error: "未授权" }, { status: 401 });
+    const list = Array.from(this.invites.values())
+      .map((inv) => ({ ...inv }))
+      .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
+    return Response.json({ ok: true, invites: list });
+  }
+
+  async handleAdminCreateInvite(request) {
+    if (!await this.requireAdmin(request)) return Response.json({ error: "未授权" }, { status: 401 });
+    let body = null;
+    try { body = await request.json(); } catch {}
+    const maxUses = Math.min(1000, Math.max(1, Math.floor(Number(body?.maxUses) || 1)));
+    const hours = Number(body?.hours);
+    const expiresAt = Number.isFinite(hours) && hours > 0 ? Date.now() + hours * 3600 * 1000 : 0;
+    const code = randomInviteCode();
+    this.invites.set(code, {
+      code,
+      remaining: maxUses,
+      maxUses,
+      expiresAt,
+      createdAt: toBeijingTime(new Date()),
+      disabled: false
+    });
+    await this.saveInvites();
+    this.logInfo(`管理员生成邀请码=${code} 次数=${maxUses} 过期=${expiresAt ? toBeijingTime(new Date(expiresAt)) : "永久"}`);
+    return Response.json({ ok: true, invite: { code, remaining: maxUses, maxUses, expiresAt, createdAt: toBeijingTime(new Date()), disabled: false } });
+  }
+
+  async handleAdminDisableInvite(request) {
+    if (!await this.requireAdmin(request)) return Response.json({ error: "未授权" }, { status: 401 });
+    let body = null;
+    try { body = await request.json(); } catch {}
+    const code = String(body?.code || "").trim();
+    const invite = this.invites.get(code);
+    if (!invite) return Response.json({ error: "邀请码不存在" }, { status: 404 });
+    invite.disabled = true;
+    await this.saveInvites();
+    return Response.json({ ok: true, code });
   }
 
   async handleApiMe(request) {
@@ -1470,6 +1662,7 @@ export class Vnts2Room {
     const cookies = parseCookies(request.headers.get("Cookie") || "");
     const token = cookies.vnts2_account || "";
     this.accountSessions.delete(token);
+    await this.saveAccountSessions();
     const res = Response.json({ ok: true });
     res.headers.append("Set-Cookie", "vnts2_account=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0");
     return res;
@@ -1484,7 +1677,7 @@ export class Vnts2Room {
       body = await request.json();
     } catch {}
     const code = String(body?.networkCode || "").trim();
-    if (!code || code.length > 32 || !isNetworkAllowed(this.allowedNetworks, code)) {
+    if (!code || code.length > 32 || !this.isNetworkAllowedByConfig(code)) {
       return Response.json({ error: "网络编号无效" }, { status: 400 });
     }
     // 直接修改持久化账户对象（currentUser 返回的是浅拷贝，写回其属性不会生效）
@@ -1515,12 +1708,26 @@ export class Vnts2Room {
     await this.state.storage.put(ACCOUNTS_KEY, obj);
   }
 
-  /** 清理过期的账户会话 */
-  cleanupAccountSessions() {
+  /** 清理过期的账户会话并持久化 */
+  async cleanupAccountSessions() {
     const now = Date.now();
+    let changed = false;
     for (const [token, session] of this.accountSessions.entries()) {
-      if (session.expires <= now) this.accountSessions.delete(token);
+      if (session.expires <= now) {
+        this.accountSessions.delete(token);
+        changed = true;
+      }
     }
+    if (changed) await this.saveAccountSessions();
+  }
+
+  /** 持久化账户会话到 DO Storage */
+  async saveAccountSessions() {
+    const obj = {};
+    for (const [token, session] of this.accountSessions.entries()) {
+      obj[token] = { username: session.username, expires: session.expires };
+    }
+    await this.state.storage.put(SESSIONS_KEY, obj);
   }
 
   /** 导出配置快照（供管理页 / 配置下载页使用） */
@@ -1580,7 +1787,7 @@ export class Vnts2Room {
     const cookies = parseCookies(request.headers.get("Cookie") || "");
     const networkCode = url.searchParams.get("network") || cookies.network_code || "";
     const gateway = url.searchParams.get("gateway") || url.searchParams.get("ip") || cookies.gateway_ip || "";
-    if (!isNetworkAllowed(this.allowedNetworks, networkCode)) return { ok: false, message: `网络编号 ${networkCode} 未被服务端允许` };
+    if (!this.isNetworkAllowedByConfig(networkCode)) return { ok: false, message: `网络编号 ${networkCode} 未被服务端允许` };
     const cfg = this.networks.get(networkCode)?.config || defaultNetworkConfig(this.defaultGatewayIp);
     if (gateway !== intToIp(cfg.gateway)) return { ok: false, message: "网关地址不匹配" };
     return { ok: true, networkCode, gateway };
@@ -1824,6 +2031,23 @@ function randomHex(bytes) {
   const buf = new Uint8Array(bytes);
   crypto.getRandomValues(buf);
   return Array.from(buf).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** 生成 8 位随机邀请码（去掉易混淆字符） */
+function randomInviteCode() {
+  const chars = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+  const buf = new Uint8Array(8);
+  crypto.getRandomValues(buf);
+  let code = "";
+  for (let i = 0; i < 8; i++) code += chars[buf[i] % chars.length];
+  return code;
+}
+
+/** 规范化注册模式：仅接受 invite/closed，其他值（含空）视为开放注册 */
+function normalizeRegistrationMode(value) {
+  const v = String(value || "").trim().toLowerCase();
+  if (v === REG_MODE_INVITE || v === REG_MODE_CLOSED) return v;
+  return REG_MODE_OPEN;
 }
 
 /** PBKDF2（100000 次迭代，SHA-256）派生密码哈希，返回十六进制字符串 */

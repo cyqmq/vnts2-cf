@@ -165,7 +165,7 @@ createApp({
 }
 
 /* ============================================================
- * 登录页（公开，用户名+密码，服务端账户跨浏览器共享）
+ * 登录页（公开，用户名+密码登录）
  * ============================================================ */
 export function renderLoginPage() {
   const content = `
@@ -181,15 +181,17 @@ export function renderLoginPage() {
       </div>
       <div class="form-group">
         <label>用户名</label>
-        <input class="form-input" v-model="form.username" type="text" placeholder="输入用户名，新用户自动注册" @keyup.enter="submit" autofocus />
+        <input class="form-input" v-model="form.username" type="text" placeholder="输入用户名" @keyup.enter="submit" autofocus />
       </div>
       <div class="form-group">
         <label>密码</label>
         <input class="form-input" v-model="form.password" type="password" placeholder="输入密码" @keyup.enter="submit" />
       </div>
-      <button class="btn btn-primary" style="width:100%" :disabled="loading" @click="submit">{{ loading ? '登录中…' : '登录 / 注册' }}</button>
-      <div class="auth-desc" style="text-align:center;margin-top:14px;">新用户名首次输入即自动注册，不同用户拥有独立个人页</div>
+      <button class="btn btn-primary" style="width:100%" :disabled="loading" @click="submit">{{ loading ? '登录中…' : '登录' }}</button>
       <div style="text-align:center;margin-top:14px;border-top:1px solid var(--divider);padding-top:14px;">
+        <span class="auth-desc">还没有账号？</span> <a href="/register">注册新账号 →</a>
+      </div>
+      <div style="text-align:center;margin-top:14px;">
         <a href="/health">无需登录，直接查看健康检测 →</a>
       </div>
     </div>
@@ -235,6 +237,108 @@ createApp({
 `;
 
   return renderShell({ title: "登录", active: "login", content, script, sidebar: false, topbar: false });
+}
+
+/* ============================================================
+ * 注册页（公开；注册模式由管理员控制：开放 / 邀请码 / 关闭）
+ * ============================================================ */
+export function renderRegisterPage() {
+  const content = `
+<div id="app">
+  <div class="auth-wrap" style="min-height:100vh;">
+    <div class="card auth-card">
+      <div class="logo-center"><div class="logo-mark" style="width:44px;height:44px;border-radius:12px;background:linear-gradient(135deg,var(--primary),var(--primary-dark));display:flex;align-items:center;justify-content:center;color:#fff;font-weight:800;font-size:22px;">V</div></div>
+      <h2>注册 VNT 账号</h2>
+      <p class="auth-desc">注册后即可加入房间、下载组网配置</p>
+      <div v-if="configLoaded && registrationClosed" class="alert alert-error">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
+        <span>当前未开放注册，请联系管理员</span>
+      </div>
+      <div v-if="error" class="alert alert-error">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.48 2 12s4.48 10 10 10 10-4.48 10-10S17.52 2 12 2zm1 15h-2v-2h2v2zm0-4h-2V7h2v6z"/></svg>
+        <span>{{ error }}</span>
+      </div>
+      <div class="form-group">
+        <label>用户名</label>
+        <input class="form-input" v-model="form.username" type="text" placeholder="输入用户名（1-64 字符）" @keyup.enter="submit" autofocus />
+      </div>
+      <div class="form-group">
+        <label>密码</label>
+        <input class="form-input" v-model="form.password" type="password" placeholder="输入密码（至少 6 位）" @keyup.enter="submit" />
+      </div>
+      <div class="form-group" v-if="configLoaded && inviteRequired">
+        <label>邀请码</label>
+        <input class="form-input" v-model="form.inviteCode" type="text" placeholder="请输入管理员提供的邀请码" @keyup.enter="submit" />
+      </div>
+      <button class="btn btn-primary" style="width:100%" :disabled="loading || (configLoaded && registrationClosed)" @click="submit">{{ loading ? '注册中…' : '注册' }}</button>
+      <div style="text-align:center;margin-top:14px;border-top:1px solid var(--divider);padding-top:14px;">
+        <span class="auth-desc">已有账号？</span> <a href="/login">返回登录 →</a>
+      </div>
+    </div>
+  </div>
+</div>`;
+
+  const script = `
+const { createApp } = Vue;
+createApp({
+  data() {
+    return {
+      form: { username: '', password: '', inviteCode: '' },
+      error: '',
+      loading: false,
+      configLoaded: false,
+      registrationMode: 'open',
+      inviteRequired: false,
+      registrationClosed: false
+    };
+  },
+  methods: {
+    async loadConfig() {
+      try {
+        const res = await fetch('/api/auth/config', { cache: 'no-store' });
+        const data = await res.json();
+        if (data.ok) {
+          this.registrationMode = data.registrationMode || 'open';
+          this.inviteRequired = !!data.inviteRequired;
+          this.registrationClosed = !!data.registrationClosed;
+        }
+      } catch (e) {}
+      this.configLoaded = true;
+    },
+    async submit() {
+      const name = this.form.username.trim();
+      if (!name) { this.error = '请输入用户名'; return; }
+      if (this.form.password.length < 6) { this.error = '密码至少 6 位'; return; }
+      if (this.inviteRequired && !this.form.inviteCode.trim()) { this.error = '请输入邀请码'; return; }
+      this.error = '';
+      this.loading = true;
+      try {
+        const res = await fetch('/api/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            username: name,
+            password: this.form.password,
+            inviteCode: this.form.inviteCode.trim()
+          })
+        });
+        const data = await res.json();
+        if (!data.ok) { this.error = data.error || '注册失败'; return; }
+        location.href = '/dashboard';
+      } catch (e) {
+        this.error = '网络错误，请重试';
+      } finally {
+        this.loading = false;
+      }
+    }
+  },
+  mounted() {
+    this.loadConfig();
+  }
+}).mount('#app');
+`;
+
+  return renderShell({ title: "注册", active: "login", content, script, sidebar: false, topbar: false });
 }
 
 /* ============================================================
@@ -584,7 +688,7 @@ createApp({
       serverVersion: ${jsonScript(data.serverVersion || "")},
       startTime: ${jsonScript(data.startTime || "")},
       runDuration: ${jsonScript(data.runDuration || "")},
-      relayServer: 'wss://' + window.location.host,
+      relayServer: 'wss://' + window.location.host + (window.location.port ? '' : ':443'),
       relayDisabled: ${jsonScript(relayDisabled)},
       joinedCount: 0,
       uploadSpeed: '0.00 KB/s',
@@ -1367,6 +1471,52 @@ export function renderAdminHtml(data) {
     </div>
   </div>
 
+  <div class="card" style="margin-bottom:16px;">
+    <div class="card-header">
+      <h2>注册与邀请码</h2>
+      <span class="subtitle">控制新用户注册方式，生成/停用邀请码</span>
+    </div>
+    <div class="card-body">
+      <div style="display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-bottom:16px;">
+        <span class="text-sm" style="font-weight:600;">注册模式：</span>
+        <label style="display:flex;align-items:center;gap:6px;"><input type="radio" value="open" v-model="registrationMode" /> 开放注册</label>
+        <label style="display:flex;align-items:center;gap:6px;"><input type="radio" value="invite" v-model="registrationMode" /> 邀请码注册</label>
+        <label style="display:flex;align-items:center;gap:6px;"><input type="radio" value="closed" v-model="registrationMode" /> 关闭注册</label>
+        <button class="btn btn-primary btn-sm" @click="saveRegistrationMode" :disabled="savingRegMode">保存</button>
+        <span v-if="regNotice" class="text-sm" style="color:var(--text-secondary);">{{ regNotice }}</span>
+      </div>
+      <div style="border-top:1px solid var(--divider);padding-top:16px;">
+        <h3 style="font-size:14px;font-weight:600;margin-bottom:10px;">生成邀请码</h3>
+        <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:16px;">
+          <input v-model.number="inviteMaxUses" type="number" min="1" max="1000" placeholder="可用次数，如 5" style="width:130px;" />
+          <input v-model.number="inviteHours" type="number" min="0" placeholder="有效小时数，0=永久" style="width:150px;" />
+          <button class="btn btn-primary btn-sm" @click="createInvite" :disabled="creatingInvite">生成邀请码</button>
+          <span v-if="inviteNotice" class="text-sm" style="color:var(--text-secondary);align-self:center;">{{ inviteNotice }}</span>
+        </div>
+        <div class="table-wrap">
+          <table class="data-table">
+            <thead>
+              <tr><th>邀请码</th><th>剩余 / 总次数</th><th>过期时间</th><th>创建时间</th><th>状态</th><th>操作</th></tr>
+            </thead>
+            <tbody>
+              <tr v-for="inv in invites" :key="inv.code">
+                <td class="mono"><strong>{{ inv.code }}</strong></td>
+                <td>{{ inv.remaining }} / {{ inv.maxUses }}</td>
+                <td>{{ inv.expiresAt ? formatTime(inv.expiresAt) : '永久有效' }}</td>
+                <td>{{ inv.createdAt }}</td>
+                <td><span class="badge" :class="inv.disabled ? 'badge-off' : (inv.remaining <= 0 ? 'badge-off' : 'badge-on')">{{ inv.disabled ? '已停用' : (inv.remaining <= 0 ? '已用完' : '可用') }}</span></td>
+                <td><button class="btn btn-sm" @click="disableInvite(inv)" :disabled="inv.disabled">{{ inv.disabled ? '已停用' : '停用' }}</button></td>
+              </tr>
+              <tr v-if="invites.length === 0">
+                <td colspan="6" class="text-sm" style="color:var(--text-muted);text-align:center;padding:16px;">暂无邀请码</td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <div class="row">
     <div class="col-6">
       <div class="card">
@@ -1485,6 +1635,14 @@ createApp({
       sessions: ${jsonScript(data.sessions)},
       logs: ${jsonScript(data.logs || [])},
       rooms: ${jsonScript((data.rooms || []).map((r) => ({ ...r, pwdInput: "", saving: false })))},
+      registrationMode: ${jsonScript(data.registrationMode || "open")},
+      invites: [],
+      inviteMaxUses: 5,
+      inviteHours: 0,
+      inviteNotice: '',
+      regNotice: '',
+      savingRegMode: false,
+      creatingInvite: false,
       showNotification: false,
       notificationType: '',
       notificationMessage: '',
@@ -1576,12 +1734,83 @@ createApp({
       document.cookie = 'vnts2_session=; expires=Thu, 01 Jan 1970 00:00:00 UTC; path=/;';
       window.location.href = '/admin';
     },
+    async saveRegistrationMode() {
+      this.savingRegMode = true;
+      this.regNotice = '';
+      try {
+        const r = await fetch('/api/admin/registration', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ mode: this.registrationMode })
+        });
+        const data = await r.json();
+        if (r.ok && data.ok) {
+          const labels = { open: '开放注册', invite: '邀请码注册', closed: '关闭注册' };
+          this.regNotice = '注册模式已保存：' + (labels[data.registrationMode] || data.registrationMode);
+        } else {
+          this.regNotice = data.error || '保存失败';
+        }
+      } catch (e) {
+        this.regNotice = '网络错误，请稍后重试';
+      } finally {
+        this.savingRegMode = false;
+      }
+    },
+    async loadInvites() {
+      try {
+        const r = await fetch('/api/admin/invites', { headers: { Accept: 'application/json' } });
+        if (!r.ok) return;
+        const data = await r.json();
+        this.invites = data.invites || [];
+      } catch (e) { /* ignore */ }
+    },
+    async createInvite() {
+      this.creatingInvite = true;
+      this.inviteNotice = '';
+      try {
+        const r = await fetch('/api/admin/invites', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ maxUses: this.inviteMaxUses, hours: this.inviteHours })
+        });
+        const data = await r.json();
+        if (r.ok && data.ok) {
+          this.inviteNotice = '已生成邀请码：' + data.invite.code;
+          this.invites.unshift(data.invite);
+        } else {
+          this.inviteNotice = data.error || '生成失败';
+        }
+      } catch (e) {
+        this.inviteNotice = '网络错误，请稍后重试';
+      } finally {
+        this.creatingInvite = false;
+      }
+    },
+    async disableInvite(inv) {
+      try {
+        const r = await fetch('/api/admin/invites/disable', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code: inv.code })
+        });
+        const data = await r.json();
+        if (r.ok && data.ok) inv.disabled = true;
+      } catch (e) { /* ignore */ }
+    },
+    formatTime(ts) {
+      const d = new Date(ts);
+      const p = (n) => String(n).padStart(2, '0');
+      return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' + p(d.getHours()) + ':' + p(d.getMinutes());
+    },
     notify(type, message) {
       this.notificationType = type;
       this.notificationMessage = message;
       this.showNotification = true;
       setTimeout(() => { this.showNotification = false; }, 4000);
     }
+  },
+  mounted() {
+    this.loadInvites();
   }
 }).mount('#app');
 `;
@@ -1750,12 +1979,15 @@ async function loadMe() {
       }
     },
     methods: {
-      generateId() {
-        this.form.device_id = 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+      newId() {
+        return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
           const r = Math.random() * 16 | 0;
           const v = c === 'x' ? r : (r & 0x3 | 0x8);
           return v.toString(16);
         });
+      },
+      generateId() {
+        this.form.device_id = this.newId();
       },
       async addManual() {
         const code = this.manualCode.trim();
@@ -1774,7 +2006,7 @@ async function loadMe() {
       },
       configValues(room) {
         const f = this.form;
-        const serverAddress = 'wss://' + window.location.host;
+        const serverAddress = 'wss://' + window.location.host + (window.location.port ? '' : ':443');
         const name = (f.name || 'vnt2').trim();
         const roomPassword = room.password || '';
         const items = [];
@@ -1783,7 +2015,7 @@ async function loadMe() {
         };
         push('token', room.networkCode, '组网编号');
         if (f.ip) push('ip', f.ip, '本机虚拟IP');
-        if (f.device_id) push('device_id', f.device_id, '设备ID');
+        push('device_id', f.device_id, '设备ID');
         push('name', name, '设备名称');
         push('server_address', serverAddress, '注册和中继服务器');
         if (roomPassword) {
@@ -1806,15 +2038,11 @@ async function loadMe() {
         const f = this.form;
         return JSON.stringify({
           config: {
-            itemKey: 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-              const r = Math.random() * 16 | 0;
-              const v = c === 'x' ? r : (r & 0x3 | 0x8);
-              return v.toString(16);
-            }),
+            itemKey: this.newId(),
             network_code: room.networkCode,
             config_name: (f.name || 'vnt2').trim(),
             ip: f.ip.trim(),
-            server: ['wss://' + window.location.host],
+            server: ['wss://' + window.location.host + (window.location.port ? '' : ':443')],
             device_id: f.device_id.trim(),
             device_name: (f.name || 'vnt2').trim(),
             tun_name: 'vnt2',
@@ -1839,6 +2067,8 @@ async function loadMe() {
         }, null, 2);
       },
       download(format, room) {
+        // 未填写设备 ID 时自动生成随机 UUID，避免客户端在只读文件系统上自动生成失败
+        if (!this.form.device_id) this.form.device_id = this.newId();
         let content = '', filename = '', mime = 'text/plain';
         if (format === 'yaml') { content = this.buildYaml(room); filename = 'vnt_config-' + room.networkCode + '.yaml'; mime = 'text/yaml'; }
         else if (format === 'toml') { content = this.buildToml(room); filename = 'vnt_config-' + room.networkCode + '.toml'; mime = 'text/plain'; }
