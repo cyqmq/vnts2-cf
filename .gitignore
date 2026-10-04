@@ -1,1 +1,4 @@
 src/version.js
+node_modules/
+.wrangler/
+*.log

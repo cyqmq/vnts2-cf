@@ -21,12 +21,22 @@ export default {
         return await stub.fetch(request);
       }
 
-      if (url.pathname === "/test" || url.pathname === "/room") {
+      // 根路径：跳转到仪表盘（未登录时前端再跳转到 /login）
+      if (url.pathname === "/") {
+        return Response.redirect(new URL("/dashboard", url.origin).toString(), 302);
+      }
+
+      if (url.pathname === "/health" || url.pathname === "/me" || url.pathname === "/login" || url.pathname === "/test" || url.pathname === "/room" || url.pathname === "/settings" || url.pathname === "/config" || url.pathname === "/dashboard" || url.pathname === "/about") {
         return await stub.fetch(request);
       }
 
       // 未配置 LOG_PASSWORD 时 /log 和 /log/clear 不路由到 Durable Object，直接跳转项目地址
       if (env.LOG_PASSWORD && (url.pathname === "/log" || url.pathname === "/log/clear")) {
+        return await stub.fetch(request);
+      }
+
+      // 未配置 ADMIN_PASSWORD 时 /admin 相关不路由到 Durable Object，直接跳转项目地址
+      if (env.ADMIN_PASSWORD && url.pathname.startsWith("/admin")) {
         return await stub.fetch(request);
       }
 

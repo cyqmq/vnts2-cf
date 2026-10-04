@@ -1,6 +1,6 @@
 // 此文件由 gen-version.js 自动生成，请勿手动修改
 import { execSync } from "child_process";
-import { writeFileSync } from "fs";
+import { readFileSync, writeFileSync } from "fs";
 import { join, dirname } from "path";
 import { fileURLToPath } from "url";
 
@@ -33,5 +33,16 @@ export const SERVER_VERSION = ${JSON.stringify(version)};
 `;
 
 const outPath = join(__dirname, "..", "src", "version.js");
+
+// 内容未变化时不写文件，避免本地开发时触发 wrangler 反复重建
+try {
+  const existing = readFileSync(outPath, "utf8");
+  if (existing === content) {
+    console.log(`[gen-version] SERVER_VERSION = ${version}（未变化）`);
+    process.exit(0);
+  }
+} catch {
+  // 文件不存在，继续写入
+}
 writeFileSync(outPath, content, "utf-8");
 console.log(`[gen-version] SERVER_VERSION = ${version}`);

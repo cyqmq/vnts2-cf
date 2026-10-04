@@ -36,7 +36,7 @@ LOCATION_HINT = "apac"
 # SERVER_TOKEN 留空会禁用 /peer/* 服务端互联接口，并停止客户端信息同步和跨服务端数据转发。
 # 示例：PEER_SERVERS = "https://vnts2-a.example.workers.dev,https://vnts2-b.example.workers.dev"
 PEER_SERVERS = ""
-SERVER_TOKEN = ""
+SERVER_TOKEN = "peer123"
 
 # 维护周期，单位秒：清理租约、刷新互联客户端列表、向本地客户端发送网关 Ping。
 MAINTENANCE_INTERVAL = "15"
@@ -49,8 +49,14 @@ DISABLE_RELAY = "0"
 # 日志级别：info/debug/off。
 LOG_LEVEL = "off"
 
-# 日志页面密码。留空时 /log 不开放且不记录日志；设置后需要 /log?password=xxx 进入。
-LOG_PASSWORD = ""
+# 日志页面密码。留空时 /log 不开放且不记录日志；设置后需要密码进入（登录后不再经 URL 传密码）。
+LOG_PASSWORD = "log123"
+
+# 管理员密码。留空时 /admin 管理页、/admin/config 配置快照均不开放；
+# 设置后需要密码登录。管理页可查看网络/设备/会话/日志并清空日志、添加房间，
+# 同时提供「日志」「互联」「设置」功能入口与配置快照下载。
+# 注意：/config 客户端配置下载页为普通用户页面（登录后可用），不再受管理员密码保护。
+ADMIN_PASSWORD = "admin123"
 
 [[durable_objects.bindings]]
 name = "VNTS2_ROOM"
