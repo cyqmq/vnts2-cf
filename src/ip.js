@@ -52,7 +52,7 @@ export function networkConfigFromClientIp(ip, defaultGateway) {
   return networkConfigFromGateway(gateway >>> 0);
 }
 
-function networkConfigFromGateway(gateway) {
+export function networkConfigFromGateway(gateway) {
   const network = (gateway & 0xffffff00) >>> 0;
   const broadcast = (network | 0xff) >>> 0;
   const prefix = 24;

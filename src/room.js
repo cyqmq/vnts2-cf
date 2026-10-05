@@ -14,7 +14,7 @@ import {
   parseSelectiveBroadcast,
   readPacket
 } from "./protocol.js";
-import { contains, defaultNetworkConfig, intToIp, networkConfigFromClientIp, parseNetworks } from "./ip.js";
+import { contains, defaultNetworkConfig, intToIp, networkConfigFromClientIp, networkConfigFromGateway, parseNetworks } from "./ip.js";
 import { SERVER_VERSION as GEN_VERSION } from "./version.js";
 import { setUiVersion } from "./ui.js";
 import { renderHealthHtml, renderLoginPage, renderRegisterPage, renderLoginHtml, renderRoomHtml, renderRoomListHtml, renderPeerLoginHtml, renderPeerHtml, renderLogLoginHtml, renderLogHtml, renderSettingsHtml, renderAdminLoginHtml, renderAdminHtml, renderConfigHtml, renderDashboardHtml, renderAboutPage } from "./ui-pages.js";
@@ -333,7 +333,9 @@ export class Vnts2Room {
 
     const isNewNetwork = !this.networks.has(reg.networkCode);
     if (isNewNetwork && this.networks.size >= MAX_NETWORKS) throw new Error("服务端网络数量已达到上限");
-    const net = this.ensureNetwork(reg.networkCode, networkConfigFromClientIp(reg.ip, this.defaultGatewayIp));
+    const resolvedConfig = this.resolveNetworkConfig(reg.networkCode, reg.ip);
+    if (!resolvedConfig) throw new Error("IP 网段已被其他网络占用，请更换虚拟 IP 或使用不同网段的 IP");
+    const net = this.ensureNetwork(reg.networkCode, resolvedConfig);
     const cfg = net.config;
     let allocation;
     try {
@@ -1368,7 +1370,7 @@ export class Vnts2Room {
     if (!code || code.length > 32) return Response.json({ error: "网络编号无效" }, { status: 400 });
     const password = String(body?.password || "").slice(0, 128);
     if (!this.allowedNetworks.has(code)) this.allowedNetworks.add(code);
-    this.ensureNetwork(code, defaultNetworkConfig(this.defaultGatewayIp));
+    this.ensureNetwork(code, this.resolveNetworkConfig(code, undefined));
     // 持久化管理员添加的房间
     const rooms = (await this.state.storage.get("vnts2-admin-rooms")) || [];
     if (!rooms.includes(code)) {
@@ -1454,6 +1456,40 @@ export class Vnts2Room {
   /** 网络编号是否允许：NETWORKS 为空（未配置白名单）时允许任意，否则仅允许配置/管理员添加的房间 */
   isNetworkAllowedByConfig(code) {
     return this.allowAllNetworks || this.allowedNetworks.has(code);
+  }
+
+  /**
+   * 解析网络配置：已存在网络返回原配置；新网络优先使用客户端指定 IP 的 /24 网段（若未占用），
+   * 否则（未指定 IP 或指定网段已被占用）自动分配下一个空闲 /24 网段。
+   * 返回 null 表示客户端指定的网段已被其他网络占用。
+   */
+  resolveNetworkConfig(code, ip) {
+    const existing = this.networks.get(code);
+    if (existing) return existing.config;
+    if (ip !== undefined && ip !== null) {
+      const cfg = networkConfigFromClientIp(ip, this.defaultGatewayIp);
+      if (this.gatewayOccupied(cfg.gateway)) return null;
+      return cfg;
+    }
+    return this.findAvailableNetworkConfig();
+  }
+
+  /** 查找下一个未被占用的 /24 网段（从默认网关所在网段开始按 /24 递增） */
+  findAvailableNetworkConfig() {
+    const base = defaultNetworkConfig(this.defaultGatewayIp);
+    for (let offset = 0; offset < 65536; offset += 256) {
+      const gw = (base.gateway + offset) >>> 0;
+      if (!this.gatewayOccupied(gw)) return networkConfigFromGateway(gw);
+    }
+    return base;
+  }
+
+  /** 该网关是否已被其他网络占用 */
+  gatewayOccupied(gateway) {
+    for (const net of this.networks.values()) {
+      if (net.config.gateway === gateway) return true;
+    }
+    return false;
   }
 
   /* ============================================================

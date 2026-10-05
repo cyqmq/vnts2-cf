@@ -540,8 +540,8 @@ export function renderDashboardHtml(data) {
       <div class="dash-chart-box">
         <svg viewBox="0 0 300 90" width="100%" height="90" preserveAspectRatio="none" style="max-width:280px;">
           <polyline fill="none" stroke="rgba(0,191,165,.12)" stroke-width="1" points="0,75 60,75 120,75 180,75 240,75 300,75"/>
-          <polyline fill="none" stroke="#F44336" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="0,62 30,58 60,60 90,52 120,55 150,47 180,50 210,42 240,45 270,37 300,40"/>
-          <polyline fill="none" stroke="#4CAF50" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" points="0,72 30,64 60,68 90,58 120,61 150,50 180,54 210,44 240,47 270,31 300,36"/>
+          <polyline fill="none" stroke="#F44336" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" :points="speedPointsTx"/>
+          <polyline fill="none" stroke="#4CAF50" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" :points="speedPointsRx"/>
         </svg>
       </div>
       <div class="dash-footer">
@@ -557,7 +557,7 @@ export function renderDashboardHtml(data) {
       <div style="display:flex;align-items:center;gap:14px;flex:1;">
         <svg viewBox="0 0 80 80" width="80" height="80" style="flex-shrink:0;">
           <circle cx="40" cy="40" r="34" fill="none" stroke="rgba(0,191,165,.15)" stroke-width="8"/>
-          <circle cx="40" cy="40" r="34" fill="none" stroke="#00BFA5" stroke-width="8" stroke-linecap="round" stroke-dasharray="202.9 213.6" transform="rotate(-90 40 40)"/>
+          <circle cx="40" cy="40" r="34" fill="none" stroke="#00BFA5" stroke-width="8" stroke-linecap="round" :stroke-dasharray="qualityDashArray" transform="rotate(-90 40 40)"/>
           <text x="40" y="44" text-anchor="middle" font-size="13" font-weight="700" fill="currentColor">{{ qualityPercent }}</text>
         </svg>
         <div class="dash-legend">
@@ -577,8 +577,8 @@ export function renderDashboardHtml(data) {
       </div>
       <div style="display:flex;align-items:center;gap:14px;flex:1;">
         <svg viewBox="0 0 80 80" width="80" height="80" style="flex-shrink:0;">
-          <circle cx="40" cy="40" r="30" fill="none" stroke="#2196F3" stroke-width="12" stroke-dasharray="141.4 188.5" transform="rotate(-90 40 40)"/>
-          <circle cx="40" cy="40" r="30" fill="none" stroke="#00E5FF" stroke-width="12" stroke-dasharray="47.1 188.5" stroke-dashoffset="-141.4" transform="rotate(-90 40 40)"/>
+          <circle cx="40" cy="40" r="30" fill="none" stroke="#2196F3" stroke-width="12" :stroke-dasharray="trafficRing.download" transform="rotate(-90 40 40)"/>
+          <circle cx="40" cy="40" r="30" fill="none" stroke="#00E5FF" stroke-width="12" :stroke-dasharray="trafficRing.upload" :stroke-dashoffset="trafficRing.offset" transform="rotate(-90 40 40)"/>
           <text x="40" y="44" text-anchor="middle" font-size="11" font-weight="700" fill="currentColor">{{ totalTxText }}</text>
         </svg>
         <div class="dash-legend">
@@ -699,14 +699,55 @@ createApp({
       latency: '-',
       onlineDevices: 0,
       offlineDevices: 0,
+      speedHistory: [],
+      txTotal: 0,
+      rxTotal: 0,
       _prev: null,
       _prevTime: 0
     };
+  },
+  computed: {
+    qualityPercentValue() {
+      return parseFloat(this.qualityPercent) || 0;
+    },
+    qualityDashArray() {
+      const circumference = 2 * Math.PI * 34;
+      const dash = (circumference * this.qualityPercentValue / 100).toFixed(1);
+      return dash + ' ' + circumference.toFixed(1);
+    },
+    speedPointsTx() {
+      return this.pointsFor(this.speedHistory.map((p) => p.tx));
+    },
+    speedPointsRx() {
+      return this.pointsFor(this.speedHistory.map((p) => p.rx));
+    },
+    trafficRing() {
+      const circumference = 2 * Math.PI * 30;
+      const total = this.txTotal + this.rxTotal;
+      if (!total) return { download: '0 ' + circumference.toFixed(1), upload: '0 ' + circumference.toFixed(1), offset: '0' };
+      const dlLen = circumference * (this.rxTotal / total);
+      const upLen = circumference - dlLen;
+      return {
+        download: dlLen.toFixed(1) + ' ' + circumference.toFixed(1),
+        upload: upLen.toFixed(1) + ' ' + circumference.toFixed(1),
+        offset: '-' + dlLen.toFixed(1)
+      };
+    }
   },
   methods: {
     copy(text) {
       if (!text) return;
       navigator.clipboard.writeText(text).then(() => alert('已复制：' + text));
+    },
+    pointsFor(values) {
+      const W = 300, H = 90, PAD = 6;
+      if (!values.length) return '';
+      const max = Math.max(1, ...values);
+      return values.map((v, i) => {
+        const x = values.length > 1 ? (i / (values.length - 1)) * W : 0;
+        const y = H - PAD - (v / max) * (H - PAD * 2);
+        return x.toFixed(1) + ',' + y.toFixed(1);
+      }).join(' ');
     },
     async tick() {
       const snap = await fetchJson('/dashboard?format=json');
@@ -733,10 +774,14 @@ createApp({
         if (dt > 0) {
           this.uploadSpeed = (Math.max(0, tx - this._prev.tx) / dt / 1024).toFixed(2) + ' KB/s';
           this.downloadSpeed = (Math.max(0, rx - this._prev.rx) / dt / 1024).toFixed(2) + ' KB/s';
+          this.speedHistory.push({ tx: parseFloat(this.uploadSpeed) || 0, rx: parseFloat(this.downloadSpeed) || 0 });
+          if (this.speedHistory.length > 20) this.speedHistory.shift();
         }
       }
       this._prev = { tx, rx };
       this._prevTime = now;
+      this.txTotal = tx;
+      this.rxTotal = rx;
       this.totalTxText = fmtBytes(tx);
       this.totalRxText = fmtBytes(rx);
       this.qualityPercent = total ? Math.round((online / total) * 100) + '%' : '0%';
