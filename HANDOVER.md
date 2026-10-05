@@ -1,8 +1,8 @@
 # vnts2-cf 项目交接文档
 
-- 交接日期：2026-10-04
+- 交接日期：2026-10-05
 - 项目地址：`cyqmq/vnts2-cf`（GitHub）
-- 项目简介：兼容 Rust VNTS2 的 Cloudflare Worker 版 WebSocket 服务端，支持 VNT2 客户端注册、P2P 打洞信息交换、TURN 中继、广播/选择性广播、多服务端互联，并带 Web 管理界面。
+- 项目简介：兼容 Rust VNTS2 的 Cloudflare Worker 版 WebSocket 服务端，支持 VNT2 客户端注册、P2P 打洞信息交换、TURN 中继、广播/选择性广播、多服务端互联，并带 Web 管理界面（账户系统 + 仪表盘 + 注册邀请码）。
 
 ---
 
@@ -15,13 +15,14 @@
 ```bash
 cd vnts2-cf
 npm install
-npm test          # node --test，当前 17/17 通过
+npm test          # node --test，当前 19/19 通过
 npm run dev       # 本地启动 wrangler dev（https://127.0.0.1:8787，自签名证书）
 npm run deploy    # 部署到 Cloudflare Workers
 ```
 
 - 本地调试需信任自签名证书或使用 `curl -k`；vnt2 客户端连接用 `--cert-mode skip`。
 - 仓库含 `test/vnt2_cli`、`test/vnt2_ctrl`（Linux x86-64 ELF，vnt 2.0.0 客户端），可直接在本机运行，无需 Docker。
+- 本地密钥写入 `.dev.vars`（参考 `.dev.vars.example`，已被 gitignore）。
 
 ---
 
@@ -32,6 +33,7 @@ npm run deploy    # 部署到 Cloudflare Workers
 ```bash
 npm run dev
 ```
+
 启动后 `https://127.0.0.1:8787`，`/health?format=json` 返回真实状态。
 
 ### 2.2 客户端注册 + P2P 打洞
@@ -57,35 +59,31 @@ cd test
 
 ---
 
-## 3. 本次已修复的 Bug（已提交）
-
-> 以下 6 个安全/稳定性修复已随账户系统一并提交（见 git log）。
+## 3. 已修复的 Bug（已提交）
 
 ### 3.1 [高危] `/config` 页面泄露管理员设置的组网密码
 
-- 问题：任何匿名访问者 `GET /config?rooms=<房间名>` 即可在 HTML 源码中看到该房间的组网密码（管理员通过 `/admin/rooms/password` 设置）。
-- 修复（`room.js` `handleConfigDownload`）：组网密码仅对两种会话发放——管理员会话（`vnts2_session` = adminHash），或持有该房间 `/room` 认证 Cookie（`network_code` + `gateway_ip`）的普通用户。
+- 问题：任何匿名访问者 `GET /config?rooms=<房间名>` 即可在 HTML 源码中看到该房间的组网密码。
+- 修复（`room.js` `handleConfigDownload`）：组网密码仅对三类会话发放——管理员会话（`vnts2_session` = adminHash）、持有该房间 `/room` 认证 Cookie 的普通用户、或已登录账户且已加入该房间（账户级授权）。
 - 新增 `hasRoomSession()` 校验房间会话。
 
 ### 3.2 [中] 登录页反射型 XSS（`</script>` 逃逸）
 
-- 问题：`renderLoginHtml`/`renderPeerLoginHtml`/`renderAdminLoginHtml`/`renderLogLoginHtml` 把 `message` 用 `JSON.stringify` 直接嵌进 `<script>` 块；`/room` 的 `authorizeStatusRequest` 会把 URL 参数 `networkCode` 反射进 message，当 `NETWORKS` 配置为白名单时，攻击者可注入 `</script><script>...`。
+- 问题：`renderLoginHtml`/`renderPeerLoginHtml`/`renderAdminLoginHtml`/`renderLogLoginHtml` 把 `message` 用 `JSON.stringify` 直接嵌进 `<script>` 块。
 - 修复（`ui-pages.js`）：4 处 `JSON.stringify(message)` 全部改为 `jsonScript(message)`（转义 `<`、U+2028/2029）。
-- 新增测试 `test/ui.test.js` 覆盖 4 个登录页的逃逸防护，17/17 通过。
 
 ### 3.3 [中] `DISABLE_RELAY=1` 被互联转发绕过
 
-- 问题：`/peer/forward` 与 `/peer/message` 的 forwardData 路径不检查 `disableRelay`，互联服务端发来的 TURN/QUIC 中转流量仍会投递给本地客户端，与"仅 P2P"配置矛盾；且互联转发不递减 TTL，与本地路径不一致。
-- 修复（`room.js`）：两条路径均解析包头，命中 `isRelayDataMessage` 且 `disableRelay` 时丢弃（返回 `delivered:false`）；转发前先 `decrementTtl`。打洞握手（PUNCH 系列）不受影响，与配置注释一致。
+- 问题：`/peer/forward` 与 `/peer/message` 的 forwardData 路径不检查 `disableRelay`；且互联转发不递减 TTL。
+- 修复（`room.js`）：两条路径均解析包头，命中 `isRelayDataMessage` 且 `disableRelay` 时丢弃；转发前先 `decrementTtl`。
 
 ### 3.4 [低] 未注册 WebSocket 会话可占满连接上限（DoS）
 
-- 问题：`MAX_SESSIONS=1024`，但未注册会话无超时，攻击者可空连接占满。
 - 修复（`room.js`）：会话记录 `openedAt`，`cleanupExpired`（随 alarm 每 ≥5s 跑）回收未注册超过 60 秒（`SESSION_IDLE_TIMEOUT_MS`）的会话。
 
 ### 3.5 [低] 互联令牌比较非恒定时间
 
-- 修复（`room.js`）：新增 `safeEqual()` 常量时间字符串比较，用于 `peerAuthorized` 和 `authReq.tokenHash` 校验。
+- 修复（`room.js`）：新增 `safeEqual()` 常量时间字符串比较。
 
 ### 3.6 [低] `jsonAuthResponse` 可能写入 `undefined` Cookie
 
@@ -93,97 +91,120 @@ cd test
 
 ---
 
-## 4. 服务端账户系统 + 仪表盘真实数据（已完成）
+## 4. 服务端账户系统 + 仪表盘 + 注册邀请码（已完成）
 
-> ✅ 2026-10-04：后端账户 API 与前端页面已全部接线，仪表盘使用真实设备流量数据。
-> 该功能已随第 3 节 Bug 修复一并提交。
+> ✅ 2026-10-05：账户 API、前端接线、注册邀请码、仪表盘真实数据均已实现并提交。
 
-### 4.1 已实现（后端）
+### 4.1 后端
 
-- `src/worker.js`：新增 `/api/*` 路由转发到 Durable Object。
+- `src/worker.js`：新增 `/api/*` 路由转发到 Durable Object；`/register` 页面路由。
 - `src/room.js`：
   - 常量：`ACCOUNTS_KEY`、`SESSIONS_KEY`、`INVITES_KEY`、`REG_MODE_KEY`、`SESSION_TTL_MS`（7 天）、`MAX_JOINED_ROOMS`(32)。
-  - 构造函数新增 `this.accounts`（用户名→账户对象）、`this.accountSessions`（token→会话）、`this.invites`（邀请码）、`this.registrationMode`（open/invite/closed）。
-  - `init()` 从 DO Storage 恢复账户（用户名、PBKDF2 密码哈希+盐、deviceName、virtualIp、createdAt、joinedRooms）、账户会话（持久化登录态）、邀请码与注册模式。
+  - 构造函数新增 `this.accounts`、`this.accountSessions`、`this.invites`、`this.registrationMode`（open/invite/closed）。
+  - `init()` 从 DO Storage 恢复账户、账户会话（持久化登录态）、邀请码与注册模式。
   - 接口：
     - `POST /api/auth/register`：注册（受注册模式控制，邀请码模式校验邀请码），成功设置 `vnts2_account` HttpOnly Cookie。
-    - `POST /api/auth/login`：仅登录，PBKDF2(100k, SHA-256) 校验，成功设置 `vnts2_account` HttpOnly Cookie。
+    - `POST /api/auth/login`：仅登录，PBKDF2(100k, SHA-256) 校验。
     - `GET /api/auth/me`：返回当前账户资料与已加入房间。
     - `GET /api/auth/config`：返回当前注册模式（open/invite/closed）。
     - `POST /api/auth/logout`：清会话与 Cookie。
     - `POST /api/rooms/join` / `POST /api/rooms/leave`：账户级加入/退出房间（跨浏览器共享）。
     - `POST /api/admin/registration`：管理员设置注册模式。
-    - `GET /api/admin/invites` / `POST /api/admin/invites` / `POST /api/admin/invites/disable`：邀请码管理。
+    - `GET/POST /api/admin/invites` 与 `POST /api/admin/invites/disable`：邀请码管理。
   - `cleanupExpired()` 中调用 `cleanupAccountSessions()` 清理过期会话并持久化。
-  - `handleDashboardPage()` 已扩展：当请求带有效账户会话时，`joinedRooms` 返回用户已加入房间的**真实设备流量**（txBytes/rxBytes/online）。
+  - `handleDashboardPage()`：带有效账户会话时返回 `joinedRooms`（含真实设备流量 txBytes/rxBytes/online），未登录不返回该字段。
 
-### 4.2 前端接线（已完成 2026-10-04）
+### 4.2 前端接线
 
-- [x] `ui-pages.js` 的 `renderLoginPage()`：改用 `POST /api/auth/login`（仅登录），新增 `renderRegisterPage()`（`/register`），移除 localStorage 用户名密码（`vnts2_users`）。
-- [x] `ui-pages.js` 的 `renderRoomListHtml()`：初始化 `GET /api/auth/me` 拉取已加入房间，加入/退出调用 `POST /api/rooms/join|leave`，移除 localStorage。
-- [x] `ui-pages.js` 的 `renderDashboardHtml()`：真实数据接入：
-  - 网络速度：轮询 `/dashboard?format=json`（5s 间隔），对 `joinedRooms[].devices[].txBytes/rxBytes` 差分算 KB/s。
-  - 网络质量：已加入房间设备在线率百分比 + 前端 `HEAD /health` 延迟实测。
-  - 流量统计：`joinedRooms` 各房间设备 tx/rx 求和。
-  - 当前设备：`me.deviceName`、`me.virtualIp`。
-  - 当前配置：真实 `relayServer`（wss://host）、已加入房间数、`DISABLE_RELAY` 状态。
-- [x] 登录/房间列表/仪表盘/配置页 401 统一跳 `/login?redirect=...`。
-- [x] 页面脚本清理旧 `vnts2_users` / `vnts2_current_user` / `vnts2_joined_rooms` localStorage 键。
-- [x] 配置页 `renderConfigHtml()`：初始化 `GET /api/auth/me`，手动添加走 `POST /api/rooms/join`，移除 localStorage。
-- [x] 后端 `handleDashboardPage()` 扩展：带有效账户会话时返回 `joinedRooms`（含真实设备流量），未登录不返回该字段。
-- [x] `npm test` 通过（17/17）。
+- `renderLoginPage()`：仅登录，`POST /api/auth/login`，移除 localStorage。
+- `renderRegisterPage()`（`/register`）：注册页，通过 `GET /api/auth/config` 感知注册模式并显示邀请码输入框。
+- `renderRoomListHtml()`：初始化 `GET /api/auth/me` 拉取已加入房间，加入/退出调用 `POST /api/rooms/join|leave`。
+- `renderConfigHtml()`：初始化 `GET /api/auth/me`，手动添加走 `POST /api/rooms/join`；下载配置自动补随机 `device_id`、`server_address` 自动补 `:443`。
+- 登录/房间列表/仪表盘/配置页 401 统一跳 `/login?redirect=...`。
+- 清理旧 `vnts2_users` / `vnts2_current_user` / `vnts2_joined_rooms` localStorage 键。
 
-### 4.3 设计说明（供后续实现参考）
+### 4.3 仪表盘真实图表
 
-- 会话 Cookie：`vnts2_account=<uuid>`，`HttpOnly; SameSite=Strict; Path=/; Max-Age=604800`。账户会话持久化到 DO Storage（`vnts2-sessions`），DO 重启后登录态仍有效。
-- 密码：PBKDF2（100000 次，随机 16 字节盐），辅助函数 `pbkdf2Hex()`、`randomHex()` 已加入 `room.js` 底部。
-- 房间密码（组网密码）与账户分离：组网密码仍由管理员在 `/admin` 设置，`/config` 按 3.1 的会话规则发放。
+- 网络速度：5s 轮询 `/dashboard?format=json`，对 `joinedRooms[].devices[].txBytes/rxBytes` 差分算 KB/s；**折线图按最近 20 个采样点动态绘制**。
+- 网络质量：已加入房间设备在线率百分比 + 前端 `HEAD /health` 延迟实测；**环形图按真实在线率动态填充**。
+- 流量统计：`joinedRooms` 各房间设备 tx/rx 求和；**环形图按真实上传/下载比例动态分割**。
+- 当前设备：`me.deviceName`、`me.virtualIp`；当前配置：真实 `relayServer`、已加入房间数、`DISABLE_RELAY` 状态。
 
-### 4.4 注册与邀请码管理（2026-10-04 新增）
+### 4.4 注册与邀请码管理
 
-- 登录页 `/login` 与注册页 `/register` 已分离；注册页通过 `GET /api/auth/config` 感知注册模式。
-- 注册模式由管理员控制（`/admin` 页面"注册与邀请码"卡片）：
-  - `open`：开放注册（默认，兼容旧行为）。
-  - `invite`：邀请码注册，注册时必须提供有效邀请码。
-  - `closed`：关闭注册。
-- 环境变量 `REGISTER_MODE=open|invite|closed` 可作为部署默认值；管理员保存后写入 DO Storage（`vnts2-registration-mode`）覆盖默认值。
-- 邀请码：
-  - 管理员生成时可设置可用次数（1-1000）与有效小时数（0=永久）。
-  - 存储于 DO Storage（`vnts2-invites`），字段：`code / remaining / maxUses / expiresAt / createdAt / disabled`。
-  - 每次注册消耗一次；次数用完自动停用；可手动停用。
-  - 邀请码为 8 位随机字符（去掉易混淆字符）。
+- 登录页 `/login` 与注册页 `/register` 已分离。
+- 注册模式由管理员控制（`/admin` 页面"注册与邀请码"卡片）：`open` 开放 / `invite` 邀请码 / `closed` 关闭。
+- 环境变量 `REGISTER_MODE` 可作为部署默认值；管理员保存后写入 DO Storage 覆盖。
+- 邀请码：管理员生成时可设置可用次数（1-1000）与有效小时数（0=永久）；每次注册消耗一次，用完自动停用，可手动停用；8 位随机字符（去易混淆字符）。
+
+### 4.5 房间自动分配独立网段
+
+- 新房间创建时自动分配独立 /24 网段（默认从 `10.46.0.0/24` 开始按 /24 递增，跳过已占用网段），避免不同房间共用同一网关。
+- 客户端指定 `--ip` 时优先使用该 IP 所在 /24；若该网段已被其他网络占用，注册返回明确错误提示更换网段。
+- 管理员添加房间同样走自动分配。
+
+### 4.6 部署安全化
+
+- `wrangler.toml` **不再包含任何明文密钥**（`SERVER_TOKEN` / `LOG_PASSWORD` / `ADMIN_PASSWORD` 已移除）。
+- 本地开发：密钥写入 `.dev.vars`（gitignore，模板见 `.dev.vars.example`）。
+- 线上部署：使用 `wrangler secret put` 注入 Secrets。
+- `README.md` 已补充完整部署指南（CLI + GitHub 集成 + 自定义域名 + Secrets）。
 
 ---
 
 ## 5. 测试
 
-- 现有 `test/protocol.test.js`（9 个）：协议编解码、IP 分配、protobuf 安全边界。
-- `test/ui.test.js`（10 个）：4 个登录页对 `</script>` 注入的转义 + 无 message 渲染、注册页包含注册接口与模式查询、登录页不再包含自动注册逻辑。
-- 当前 `npm test`：19/19 通过。
-- 注意：`test/ui.test.js` 断言断言字符串为 `\u003c/script>`（jsonScript 只转义 `<`）。
+- `test/protocol.test.js`（9 个）：协议编解码、IP 分配、protobuf 安全边界。
+- `test/ui.test.js`（10 个）：4 个登录页 `</script>` 转义 + 无 message 渲染、注册页包含注册接口与模式查询、登录页不再包含自动注册逻辑。
+- 当前 `npm test`：**19/19 通过**。
+- 注意：`test/ui.test.js` 断言字符串为 `\u003c/script>`（jsonScript 只转义 `<`）。
 
 ---
 
-## 6. 已知遗留问题 / 建议
+## 6. 部署指引（摘要，详见 README.md）
 
-- `wrangler.toml` 中提交了默认密钥：`SERVER_TOKEN=peer123`、`LOG_PASSWORD=log123`、`ADMIN_PASSWORD=admin123`，**部署前务必修改**（建议改为通过 Cloudflare Secrets 注入）。
-- `/dashboard`、`/room`（列表模式）、`/settings` 无需登录即可查看房间清单（网络编号、网段、在线数），属当前产品设计；如需收紧可参考账户系统接入后做登录墙。
+```bash
+# 1. 登录 Cloudflare（浏览器授权）
+npx wrangler login
+
+# 2. 注入线上密钥
+npx wrangler secret put SERVER_TOKEN
+npx wrangler secret put LOG_PASSWORD
+npx wrangler secret put ADMIN_PASSWORD
+
+# 3. 部署
+npm run deploy
+```
+
+- 部署后访问 `https://vnts2-cf.<子域>.workers.dev`。
+- 自定义域名：控制台 Worker → Settings → Domains & Routes → Add Custom Domain；或 `wrangler.toml` 配置 `routes`（见 README）。
+- 客户端连接：`wss://你的域名:443`（必须带端口，配置页会自动补 `:443`）。
+
+---
+
+## 7. 已知遗留问题 / 建议
+
+- 免费计划每日 100k 请求（Worker + DO + WebSocket 消息 + Alarm 全部计入）；alarm 每 15s 约 5,760 次/天。中小规模可用，生产建议 Workers Paid。
+- `/dashboard`、`/room`（列表模式）、`/settings` 无需登录即可查看房间清单（网络编号、网段、在线数），属当前产品设计；如需收紧可加登录墙。
 - `peerAuthorized` 已做常量时间比较，但长度不同仍会短路（长度信息泄露风险极低，可接受）。
 - 沙箱无公网环境，真实 NAT 穿透需在公网部署后使用两台真实 NAT 内机器验证。
 
 ---
 
-## 7. 关键文件索引
+## 8. 关键文件索引
 
 | 文件 | 说明 |
 |---|---|
-| `src/worker.js` | Worker 入口/路由（含新增 `/api/*`） |
-| `src/room.js` | Durable Object 核心：注册/IP/转发/打洞/互联/账户 API |
+| `src/worker.js` | Worker 入口/路由（含 `/api/*`、`/register`） |
+| `src/room.js` | Durable Object 核心：注册/IP/转发/打洞/互联/账户/邀请码 API |
 | `src/protocol.js` | 16 字节包头 + protobuf 协议解析 |
 | `src/protobuf.js` | protobuf 读写器（2MB 上限） |
-| `src/ip.js` | IP/CIDR 工具 |
+| `src/ip.js` | IP/CIDR 工具（含网段自动分配） |
 | `src/ui.js` | 页面外壳/公共 UI |
-| `src/ui-pages.js` | 所有页面渲染（登录/仪表盘/房间/日志/管理…） |
+| `src/ui-pages.js` | 所有页面渲染（登录/注册/仪表盘/房间/日志/管理…） |
 | `test/vnt2_cli` | vnt2 官方 Linux 客户端（demo 用） |
 | `test/vnt2_ctrl` | 控制端（clients/route） |
-| `scripts/docker-e2e-test.sh` | 双服务端 + 双客户端端到端测试（需 Docker，沙箱无 Docker 未跑） |
+| `scripts/docker-e2e-test.sh` | 双服务端 + 双客户端端到端测试（需 Docker） |
+| `wrangler.toml` | Worker 配置（无明文密钥） |
+| `.dev.vars.example` | 本地密钥模板 |
+| `README.md` | 完整使用与部署文档 |
