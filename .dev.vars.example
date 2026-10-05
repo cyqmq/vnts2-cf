@@ -1,0 +1,5 @@
+# 本地开发密钥模板：复制为 .dev.vars 并填入真实值（.dev.vars 已被 gitignore，不会提交）
+# 线上部署请改用 `wrangler secret put <名称>` 注入，不要使用这些默认值！
+SERVER_TOKEN=你的互联令牌（如 peer123，不互联可留空）
+LOG_PASSWORD=你的日志密码
+ADMIN_PASSWORD=你的管理员密码

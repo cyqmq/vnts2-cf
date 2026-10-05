@@ -291,16 +291,75 @@ JSON 格式：`/room?format=json&network=xxx&gateway=xxx`
 
 ## Cloudflare 部署
 
-1. Fork 本仓库。
-2. 登录[Cloudflare Dashboard](https://dash.cloudflare.com)
-3. 进入 Workers & Pages → 创建应用程序（Create Application） →  Workers →  链接到github仓库 选择你刚刚fork的仓库，直接部署
-4. 绑定自定义域名：打开 Worker 设置 → Triggers(域和路由) → 添加 → Custom Domains(自定义域名)，添加你的域名并保存。
-5.vnt2客户端采用 `-s wss://域名:443` 连接
+### 方式一：Wrangler CLI 部署（推荐，支持 Secrets）
 
-## vnt2 客户端示例
+适合有本机命令行环境的用户，可完整设置密钥与变量。
 
 ```bash
-# 普通连接
+# 进入项目目录
+cd vnts2-cf
+
+# 安装依赖
+npm install
+
+# 登录 Cloudflare（浏览器授权）
+npx wrangler login
+
+# 注入线上密钥（每个命令会交互式提示输入值）
+npx wrangler secret put SERVER_TOKEN
+npx wrangler secret put LOG_PASSWORD
+npx wrangler secret put ADMIN_PASSWORD
+
+# 部署
+npm run deploy
+```
+
+部署成功后访问 `https://vnts2-cf.<你的子域>.workers.dev`。
+
+### 方式二：Cloudflare Dashboard + GitHub 集成
+
+1. Fork 本仓库。
+2. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com)。
+3. Workers & Pages → 创建应用程序（Create Application）→ Workers → 连接 GitHub 仓库，选择你 Fork 的仓库，直接部署。
+4. 设置线上密钥：进入 Worker → Settings → Variables → 添加加密变量（Encrypt）：
+   - `SERVER_TOKEN`
+   - `LOG_PASSWORD`
+   - `ADMIN_PASSWORD`
+5. 保存后重新部署（Deployments → Retry deployment）。
+
+> ⚠️ 部署前务必设置密钥：仓库不包含任何明文密钥。
+> 未设置 `ADMIN_PASSWORD` 时管理页不可用；未设置 `SERVER_TOKEN` 时禁用服务端互联。
+
+### 自定义域名
+
+**方式 A：控制台添加（推荐）**
+
+打开 Worker → Settings → Domains & Routes → 添加自定义域名（Custom Domain），输入如 `vnt.example.com`，Cloudflare 会自动配置 DNS 与 SSL。
+
+**方式 B：wrangler.toml 配置路由**
+
+在 `wrangler.toml` 中加入（二选一）：
+
+```toml
+# 使用自定义域（自动创建 DNS）
+routes = [
+  { pattern = "vnt.example.com", custom_domain = true }
+]
+```
+
+```toml
+# 使用现有 zone 的路由（需 DNS 记录已指向 Cloudflare）
+routes = [
+  { pattern = "vnt.example.com/*", zone_id = "你的zone_id" }
+]
+```
+
+然后重新执行 `npm run deploy`。
+
+### 连接客户端
+
+```bash
+# 普通连接（自定义域名/workers.dev 均需显式带 :443）
 sudo ./vnt2_cli -s wss://你的域名:443 -n 你的网络编号 --cert-mode skip
 
 # 强制 IPv4（避免 IPv6 超时）
@@ -316,8 +375,11 @@ sudo ./vnt2_cli -s wss://你的域名:443 -n 你的网络编号 --cert-mode skip
 
 # 子网输入/输出
 sudo ./vnt2_cli -s wss://你的域名:443 -n 你的网络编号 --ip 10.88.0.2 --cert-mode skip -i 172.30.2.0/24,10.88.0.2
-sudo ./vnt2_cli -s wss://你的域名:443 -n 你的网络编号t --ip 10.88.0.3 --cert-mode skip -o 172.30.2.0/24
+sudo ./vnt2_cli -s wss://你的域名:443 -n 你的网络编号 --ip 10.88.0.3 --cert-mode skip -o 172.30.2.0/24
 ```
+
+> 注意：vnt2 客户端要求 `server_address` 必须包含端口（`host:port`），
+> 因此连接时使用 `wss://域名:443`；配置页下载的配置会自动补 `:443`。
 
 ## 本地 Docker 测试
 
@@ -367,7 +429,7 @@ Rust `vnts2` 配置字段和 `vnts2-cf` 环境变量对照：
 | `server_quic_bind` | 不支持 | Worker 不能监听 QUIC peer |
 | `peer_servers` | `PEER_SERVERS` | Worker peer 地址 |
 | `server_token` | `SERVER_TOKEN` | peer 共享令牌 |
-| `custom_nets` | 不支持 | 网段由首个客户端 `--ip` 推导 |
+| `custom_nets` | 部分支持 | 新房间自动分配独立 /24 网段，也可由客户端 `--ip` 所在网段推导 |
 | `network_secrets` | 不支持 | 客户端密码不参与服务端校验 |
 
 ### Worker 扩展参数
@@ -381,9 +443,11 @@ Rust `vnts2` 配置字段和 `vnts2-cf` 环境变量对照：
 | `MAINTENANCE_INTERVAL` | `15` | 维护周期（秒） |
 | `DISABLE_RELAY` | `0` | 禁止服务端中转 |
 | `LOG_LEVEL` | `info` | 日志级别 |
-| `LOG_PASSWORD` | 空 | 日志页面密码，未配置不记录日志 |
+| `LOG_PASSWORD` | 空 | 日志页面密码（Secret），未配置不记录日志 |
 | `PEER_SERVERS` | 空 | 互联服务端地址列表 |
-| `SERVER_TOKEN` | 空 | 互联共享令牌 |
+| `SERVER_TOKEN` | 空 | 互联共享令牌（Secret） |
+| `ADMIN_PASSWORD` | 空 | 管理员密码（Secret），未配置管理页不可用 |
+| `REGISTER_MODE` | `open` | 注册模式：`open` / `invite` / `closed`，可在管理页动态切换 |
 | `SERVER_VERSION` | 自动生成 | 版本号（部署时自动生成） |
 
 ## 稳定性和错误处理
@@ -399,13 +463,43 @@ Rust `vnts2` 配置字段和 `vnts2-cf` 环境变量对照：
 ## 开发命令
 
 ```bash
-npm test          # 运行测试
-npm run gen-version # 生成版本号
-npm run dev       # 本地开发
-npm run deploy    # 部署到 Cloudflare
-npm run tail      # 查看日志
-npm run docker:e2e # Docker 端到端测试
+# 运行测试
+npm test
+
+# 生成版本号
+npm run gen-version
+
+# 本地开发（自动加载 .dev.vars 中的密钥）
+npm run dev
+
+# 部署到 Cloudflare（部署前先执行 wrangler secret put 注入密钥）
+npm run deploy
+
+# 查看线上日志
+npm run tail
+
+# Docker 端到端测试
+npm run docker:e2e
 ```
+
+### 本地密钥（.dev.vars）
+
+本地 `wrangler dev` 会读取项目根目录的 `.dev.vars` 文件（已被 gitignore，不会提交）。参考 `.dev.vars.example` 创建：
+
+```bash
+# 复制模板并填入真实值
+cp .dev.vars.example .dev.vars
+```
+
+`.dev.vars` 内容示例：
+
+```bash
+SERVER_TOKEN=peer123
+LOG_PASSWORD=log123
+ADMIN_PASSWORD=admin123
+```
+
+线上部署时请改用 `wrangler secret put` 注入，切勿使用示例值。
 
 ## 免责声明
 
