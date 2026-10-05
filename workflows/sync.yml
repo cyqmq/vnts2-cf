@@ -34,7 +34,7 @@ jobs:
         uses: aormsby/Fork-Sync-With-Upstream-action@v3.4
         with:
           # 上游仓库地址（原始仓库）
-          upstream_sync_repo: lmq8267/vnts-cf
+          upstream_sync_repo: lmq8267/vnts2-cf
           # 上游仓库分支
           upstream_sync_branch: master
           # 当前 Fork 仓库需要同步的分支

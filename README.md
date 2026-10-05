@@ -253,7 +253,7 @@ JSON 格式：`/room?format=json&network=xxx&gateway=xxx`
                                                         [🔝]
 ```
 
-认证方式：`/log?password=xxx`
+认证方式：访问 `/log` 输入密码登录（POST 提交，密码不经过 URL）
 
 - 日志包含时间（北京时间）、级别（彩色标签）、消息内容
 - 保留最近 500 条，持久化到 DO Storage
