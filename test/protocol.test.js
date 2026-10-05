@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { encodeRegResponse, encodeRpcClientListResponse, encodeServerMessage, parseRequestMessage, parseServerMessage, readPacket, makePacket, MSG } from "../src/protocol.js";
+import { encodeRegResponse, encodeRpcClientListResponse, encodeServerMessage, encodeSubnetSyncResponse, parseRequestMessage, parseServerMessage, parseSubnetSyncRequest, readPacket, makePacket, MSG } from "../src/protocol.js";
 import { ProtoReader, ProtoWriter } from "../src/protobuf.js";
 import { defaultNetworkConfig, intToIp, ipToInt, isNetworkAllowed, networkConfigFromClientIp, parseNetworks } from "../src/ip.js";
 
@@ -56,6 +56,79 @@ test("ProtoReader.skip 对 length-delimited 字段精确定位", () => {
   r.skip(wire);
   assert.equal(r.eof(), true, "skip 后应精确到达末尾，不再残留字节");
 });
+
+test("解码含 advertised_subnets 的 vnt 2.0.10 注册请求", () => {
+  const reg = new ProtoWriter();
+  reg.string(1, "smoke");
+  reg.string(2, "v210-dev");
+  reg.string(4, "v210-dev");
+  reg.string(5, "2.0.10");
+  reg.bool(7, true);
+  const sub = new ProtoWriter();
+  sub.fixed32(1, ipToInt("192.168.10.0"));
+  sub.uint(2, 24);
+  reg.message(10, sub.finish());
+  reg.bool(11, true); // allow_ikev2
+  reg.bool(12, false); // allow_wireguard
+  reg.bytes(14, new Uint8Array(32).fill(0xcd)); // client_instance_id
+  const req = new ProtoWriter();
+  req.message(1, reg.finish());
+
+  const msg = parseRequestMessage(req.finish());
+  assert.equal(msg.reg.advertisedSubnets.length, 1);
+  assert.equal(msg.reg.advertisedSubnets[0].network, ipToInt("192.168.10.0"));
+  assert.equal(msg.reg.advertisedSubnets[0].prefixLen, 24);
+  assert.equal(msg.reg.allowIkev2, true);
+  assert.equal(msg.reg.allowWireguard, false);
+  assert.equal(msg.reg.clientInstanceId.length, 32);
+});
+
+test("SubnetSync 请求响应编解码", () => {
+  const req = new ProtoWriter();
+  req.bytes(1, new Uint8Array(32).fill(0x11));
+  const parsed = parseSubnetSyncRequest(req.finish());
+  assert.equal(parsed.knownHash.length, 32);
+
+  const resp = encodeSubnetSyncResponse({
+    snapshotHash: new Uint8Array(32).fill(0x22),
+    nodes: [{ ip: ipToInt("10.88.0.2"), subnets: [{ network: ipToInt("192.168.10.0"), prefixLen: 24 }] }]
+  });
+  const r = new ProtoReader(resp);
+  let snapshotHash = null;
+  let nodes = [];
+  while (!r.eof()) {
+    const { field, wire } = r.readTag();
+    if (field === 1 && wire === 2) snapshotHash = r.readBytes();
+    else if (field === 2 && wire === 2) nodes.push(parseTestNode(r.readBytes()));
+    else r.skip(wire);
+  }
+  assert.equal(snapshotHash.length, 32);
+  assert.equal(nodes.length, 1);
+  assert.equal(nodes[0].ip, ipToInt("10.88.0.2"));
+  assert.equal(nodes[0].subnets[0].network, ipToInt("192.168.10.0"));
+  assert.equal(nodes[0].subnets[0].prefixLen, 24);
+});
+
+function parseTestNode(bytes) {
+  const r = new ProtoReader(bytes);
+  const out = { ip: 0, subnets: [] };
+  while (!r.eof()) {
+    const { field, wire } = r.readTag();
+    if (field === 1 && wire === 5) out.ip = r.readFixed32();
+    else if (field === 2 && wire === 2) {
+      const sr = new ProtoReader(r.readBytes());
+      const subnet = { network: 0, prefixLen: 0 };
+      while (!sr.eof()) {
+        const t = sr.readTag();
+        if (t.field === 1 && t.wire === 5) subnet.network = sr.readFixed32();
+        else if (t.field === 2 && t.wire === 0) subnet.prefixLen = Number(sr.readVarint());
+        else sr.skip(t.wire);
+      }
+      out.subnets.push(subnet);
+    } else r.skip(wire);
+  }
+  return out;
+}
 
 test("编码注册响应 oneof", () => {
   const bytes = encodeRegResponse({

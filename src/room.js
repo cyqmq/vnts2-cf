@@ -7,11 +7,13 @@ import {
   encodeRegResponse,
   encodeRpcClientListResponse,
   encodeServerMessage,
+  encodeSubnetSyncResponse,
   makePacket,
-  parseServerMessage,
   parseRequestMessage,
   parseRpcRequest,
   parseSelectiveBroadcast,
+  parseServerMessage,
+  parseSubnetSyncRequest,
   readPacket
 } from "./protocol.js";
 import { contains, defaultNetworkConfig, intToIp, networkConfigFromClientIp, networkConfigFromGateway, parseNetworks } from "./ip.js";
@@ -383,6 +385,11 @@ export class Vnts2Room {
       existing.name = reg.name || "";
       existing.version = reg.version || "";
       existing.keySign = reg.keySign;
+      existing.advertisedSubnets = reg.advertisedSubnets || [];
+      existing.allowIkev2 = !!reg.allowIkev2;
+      existing.allowWireguard = !!reg.allowWireguard;
+      existing.clientInstanceId = reg.clientInstanceId || new Uint8Array(0);
+      existing.clientType = 0; // VNT
       existing.lastConnectedTime = unixSeconds();
       existing.disconnectTime = undefined;
       existing.sessionId = sessionId;
@@ -420,6 +427,11 @@ export class Vnts2Room {
       name: reg.name || "",
       version: reg.version || "",
       keySign: reg.keySign,
+      advertisedSubnets: reg.advertisedSubnets || [],
+      allowIkev2: !!reg.allowIkev2,
+      allowWireguard: !!reg.allowWireguard,
+      clientInstanceId: reg.clientInstanceId || new Uint8Array(0),
+      clientType: 0, // VNT
       online: true,
       lastConnectedTime: unixSeconds(),
       disconnectTime: undefined,
@@ -487,6 +499,13 @@ export class Vnts2Room {
         for (const ip of selective.ips) {
           if (ip !== packet.srcId && !this.forwardToIp(net, ip, inner, innerPacket.destId)) await this.forwardToPeers(session.networkCode, ip, inner);
         }
+      }
+    } else if (packet.msgType === MSG.SUB_NET_SYNC_REQ) {
+      const req = parseSubnetSyncRequest(packet.payload);
+      const snapshot = await this.subnetSnapshot(session.networkCode, packet.srcId);
+      if (!bytesEqual(req.knownHash, snapshot.hash)) {
+        const payload = encodeSubnetSyncResponse({ snapshotHash: snapshot.hash, nodes: snapshot.nodes });
+        this.send(session, makePacket(MSG.SUB_NET_SYNC_RES, payload, { gateway: true, ttl: 1 }));
       }
     }
   }
@@ -1492,6 +1511,65 @@ export class Vnts2Room {
     return false;
   }
 
+  /**
+   * 子网同步快照：收集在线设备宣告的子网（排除请求者自己），
+   * 生成与 vnts 兼容的 (snapshot_hash, NodeSubnetRoutes[])。
+   */
+  async subnetSnapshot(networkCode, excludeIp) {
+    const net = this.networks.get(networkCode);
+    const byIp = new Map();
+    if (net) {
+      for (const device of net.devices.values()) {
+        if (!device.online || device.ip === excludeIp) continue;
+        const subnets = device.advertisedSubnets || [];
+        if (subnets.length) byIp.set(device.ip, subnets.map((s) => ({ network: s.network >>> 0, prefixLen: s.prefixLen })));
+      }
+    }
+    return this.canonicalSubnetSnapshot(byIp);
+  }
+
+  /** 生成与 vnts canonical_subnet_snapshot 一致的快照哈希与节点路由 */
+  async canonicalSubnetSnapshot(byIp) {
+    const sortedIps = [...byIp.keys()].sort((a, b) => a - b);
+    const claimed = new Set();
+    const filtered = new Map();
+    for (const ip of sortedIps) {
+      const seen = new Set();
+      const uniqueSubnets = [];
+      for (const s of byIp.get(ip)) {
+        const key = `${s.network}/${s.prefixLen}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        uniqueSubnets.push(s);
+      }
+      uniqueSubnets.sort((a, b) => a.network - b.network || a.prefixLen - b.prefixLen);
+      for (const s of uniqueSubnets) {
+        const key = `${s.network}/${s.prefixLen}`;
+        if (claimed.has(key)) continue; // 相同 CIDR 只保留最小节点 IP
+        claimed.add(key);
+        if (!filtered.has(ip)) filtered.set(ip, []);
+        filtered.get(ip).push(s);
+      }
+    }
+    const nodes = [];
+    for (const [ip, subnets] of filtered) {
+      if (subnets.length) nodes.push({ ip: ip >>> 0, subnets });
+    }
+    const parts = [];
+    const u32be = (v) => [(v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff];
+    parts.push(...u32be(nodes.length));
+    for (const node of nodes) {
+      parts.push(...u32be(node.ip));
+      parts.push(...u32be(node.subnets.length));
+      for (const s of node.subnets) {
+        parts.push(...u32be(s.network));
+        parts.push(s.prefixLen);
+      }
+    }
+    const hash = await sha256Bytes(new Uint8Array(parts));
+    return { hash, nodes };
+  }
+
   /* ============================================================
    * 服务端账户与会话（跨浏览器共享登录态与已加入房间）
    * ============================================================ */
@@ -2060,6 +2138,21 @@ function isRelayDataMessage(msgType) {
 async function sha256Hex(value) {
   const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(String(value)));
   return Array.from(new Uint8Array(digest)).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** 直接对字节数组做 SHA-256，返回 Uint8Array（用于子网快照哈希） */
+async function sha256Bytes(value) {
+  const data = value instanceof Uint8Array ? value : new TextEncoder().encode(String(value));
+  const digest = await crypto.subtle.digest("SHA-256", data);
+  return new Uint8Array(digest);
+}
+
+/** 常量时间字节数组比较（用于子网快照哈希比对） */
+function bytesEqual(a, b) {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) diff |= a[i] ^ b[i];
+  return diff === 0;
 }
 
 /** 生成指定字节数的随机十六进制字符串 */

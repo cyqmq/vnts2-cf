@@ -21,7 +21,9 @@ export const MSG = {
   QUIC: 17,
   RELAY_PROBE_REPLY: 18,
   RELAY_PROBE_CLIENT: 18,
-  RELAY_PROBE_REPLY_CLIENT: 19
+  RELAY_PROBE_REPLY_CLIENT: 19,
+  SUB_NET_SYNC_REQ: 23,
+  SUB_NET_SYNC_RES: 24
 };
 
 export const FLAG_COMPRESSED = 0x80;
@@ -44,7 +46,17 @@ export function parseRequestMessage(bytes) {
 
 function parseRegRequest(bytes) {
   const r = new ProtoReader(bytes);
-  const reg = { ip: undefined, keySign: undefined, ipVariable: false, serverId: 0, registrationMode: 0 };
+  const reg = {
+    ip: undefined,
+    keySign: undefined,
+    ipVariable: false,
+    serverId: 0,
+    registrationMode: 0,
+    advertisedSubnets: [],
+    allowIkev2: false,
+    allowWireguard: false,
+    clientInstanceId: new Uint8Array(0)
+  };
   while (!r.eof()) {
     const { field, wire } = r.readTag();
     if (field === 1 && wire === 2) reg.networkCode = r.readString();
@@ -56,18 +68,37 @@ function parseRegRequest(bytes) {
     else if (field === 7 && wire === 0) reg.ipVariable = r.readBool();
     else if (field === 8 && wire === 5) reg.serverId = r.readFixed32();
     else if (field === 9 && wire === 0) reg.registrationMode = Number(r.readVarint());
+    else if (field === 10 && wire === 2) reg.advertisedSubnets.push(parseIpv4Subnet(r.readBytes()));
+    else if (field === 11 && wire === 0) reg.allowIkev2 = r.readBool();
+    else if (field === 12 && wire === 0) reg.allowWireguard = r.readBool();
+    else if (field === 13 && wire === 2) r.skip(wire); // subscription：本实现不支持，跳过
+    else if (field === 14 && wire === 2) reg.clientInstanceId = r.readBytes();
     else r.skip(wire);
   }
   return reg;
 }
 
-export function encodeRegResponse({ ip, prefixLen, gateway, serverVersion }) {
+/** 解析 Ipv4Subnet：fixed32 network=1, uint prefix_len=2 */
+function parseIpv4Subnet(bytes) {
+  const r = new ProtoReader(bytes);
+  let network = 0;
+  let prefixLen = 0;
+  while (!r.eof()) {
+    const { field, wire } = r.readTag();
+    if (field === 1 && wire === 5) network = r.readFixed32();
+    else if (field === 2 && wire === 0) prefixLen = Number(r.readVarint());
+    else r.skip(wire);
+  }
+  return { network: network >>> 0, prefixLen };
+}
+
+export function encodeRegResponse({ ip, prefixLen, gateway, serverVersion, subnetSyncSupported = true }) {
   const m = new ProtoWriter();
   m.fixed32(1, ip);
   m.uint(2, prefixLen);
   m.fixed32(3, gateway);
   m.string(4, serverVersion);
-  m.bool(5, false); // subnet_sync_supported：本实现未启用子网同步
+  m.bool(5, subnetSyncSupported); // subnet_sync_supported：本实现支持子网同步
   m.bool(6, false); // subscription_config_supported：本实现未启用订阅配置
   // field 7 subscription：无
   m.bytes(8, randomInstanceId()); // server_instance_id：客户端期望的实例标识
@@ -75,6 +106,36 @@ export function encodeRegResponse({ ip, prefixLen, gateway, serverVersion }) {
   const w = new ProtoWriter();
   w.message(1, m.finish());
   return w.finish();
+}
+
+/** 解析 SubnetSyncRequest：bytes known_hash=1 */
+export function parseSubnetSyncRequest(bytes) {
+  const r = new ProtoReader(bytes);
+  const out = { knownHash: new Uint8Array(0) };
+  while (!r.eof()) {
+    const { field, wire } = r.readTag();
+    if (field === 1 && wire === 2) out.knownHash = r.readBytes();
+    else r.skip(wire);
+  }
+  return out;
+}
+
+/** 编码 SubnetSyncResponse：bytes snapshot_hash=1, repeated NodeSubnetRoutes nodes=2 */
+export function encodeSubnetSyncResponse({ snapshotHash, nodes }) {
+  const m = new ProtoWriter();
+  m.bytes(1, snapshotHash);
+  for (const node of nodes || []) {
+    const n = new ProtoWriter();
+    n.fixed32(1, node.ip);
+    for (const subnet of node.subnets || []) {
+      const s = new ProtoWriter();
+      s.fixed32(1, subnet.network);
+      s.uint(2, subnet.prefixLen);
+      n.message(2, s.finish());
+    }
+    m.message(2, n.finish());
+  }
+  return m.finish();
 }
 
 /** 生成 32 字节随机实例 ID（Cloudflare Workers / Node 均支持） */
@@ -108,6 +169,7 @@ export function encodeClientSimpleInfoList({ dataVersion, list, isAll, time }) {
     const c = new ProtoWriter();
     c.fixed32(1, item.ip);
     c.bool(2, item.online);
+    c.uint(3, item.clientType || 0); // ClientType：0=VNT（默认），1=IKEV2，2=WIREGUARD
     w.message(2, c.finish());
   }
   w.bool(3, isAll);
