@@ -83,6 +83,7 @@
 | **网关 Ping** | ✅ | ✅ | 客户端延迟检测 |
 | **客户端列表** | ✅ | ✅ | `vnt2_ctrl clients` RPC |
 | **服务端互联** | ✅ (QUIC) | ✅ (HTTPS) | 实现不同服务端互通 |
+| **订阅配置** | ✅ | ✅ | 签发 `vnt2://join` 订阅链接，客户端 `--sub` 自动获取受管配置 |
 | **Web 管理页** | ✅ (内置) | ✅ (Worker 页面) | `/dashboard`、`/room`、`/config`、`/about`、`/health`、`/admin`、`/log`、`/peer` |
 | **持久化** | ✅ (SQLite) | ✅ (DO Storage) | 设备和 IP 持久化 |
 | **操作日志** | ✅ | ✅ | 持久化日志页面 |
@@ -124,6 +125,8 @@ sudo ./vnt2_cli -s wss://你的域名:443 -n 你的网络编号
 - 服务端网关节点在 `vnt2_ctrl clients` 中作为显示项出现。
 - TURN、QUIC、广播、选择性广播中转。
 - 仅 P2P 模式，禁止服务端中转。
+- 子网同步（`SubnetSyncReq/Res`，客户端 `--auto-sync-subnet` 可同步各节点宣告子网）。
+- 订阅配置：管理 API 创建受管设备配置并签发 `vnt2://join/2/...` 订阅链接，vnt 2.0.10 客户端 `--sub <link>` 自动获取网络/设备配置（认证基于 SHA-256 共享密钥证明）。
 - `/dashboard`、`/room`、`/config`、`/about`、`/health`、`/admin`、`/log`、`/peer` 中文页面。
 - 基于 `ServerMessage` protobuf 的 Worker 服务端互联。
 - 操作日志持久化到 DO Storage（受 `LOG_PASSWORD` 控制）。

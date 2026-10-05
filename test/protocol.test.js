@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { encodeRegResponse, encodeRpcClientListResponse, encodeServerMessage, encodeSubnetSyncResponse, parseRequestMessage, parseServerMessage, parseSubnetSyncRequest, readPacket, makePacket, MSG } from "../src/protocol.js";
+import { clientProof, constantTimeEqual, encodeRegResponse, encodeResponseMessage, encodeRpcClientListResponse, encodeServerMessage, encodeSubnetSyncResponse, encodeSubscriptionConfigEnvelope, parseRequestMessage, parseServerMessage, parseSubnetSyncRequest, readPacket, makePacket, MSG, serverProof, subscriptionContentSha256 } from "../src/protocol.js";
 import { ProtoReader, ProtoWriter } from "../src/protobuf.js";
 import { defaultNetworkConfig, intToIp, ipToInt, isNetworkAllowed, networkConfigFromClientIp, parseNetworks } from "../src/ip.js";
 
@@ -129,6 +129,153 @@ function parseTestNode(bytes) {
   }
   return out;
 }
+
+test("解码含订阅的注册请求", () => {
+  const reg = new ProtoWriter();
+  reg.string(1, "smoke");
+  reg.string(2, "sub-dev");
+  reg.string(4, "sub-dev");
+  reg.string(5, "2.0.10");
+  reg.bool(7, true);
+  const sub = new ProtoWriter();
+  sub.string(1, "smoke");
+  sub.string(2, "sub-dev");
+  sub.bytes(3, new Uint8Array(32).fill(0x31)); // client_nonce
+  sub.bytes(4, new Uint8Array(32).fill(0x32)); // client_proof
+  sub.bytes(5, new Uint8Array(32).fill(0x33)); // instance_id
+  sub.uint64(6, 2); // applied_revision
+  reg.message(13, sub.finish());
+  const req = new ProtoWriter();
+  req.message(1, reg.finish());
+  const parsed = parseRequestMessage(req.finish());
+  assert.equal(parsed.reg.subscription.networkCode, "smoke");
+  assert.equal(parsed.reg.subscription.deviceId, "sub-dev");
+  assert.equal(parsed.reg.subscription.clientNonce.length, 32);
+  assert.equal(parsed.reg.subscription.appliedRevision, 2);
+});
+
+test("解码订阅控制请求（注册/获取/心跳/回执）", () => {
+  const reg = new ProtoWriter();
+  reg.string(1, "join-1");
+  reg.bytes(3, new Uint8Array(32).fill(0x41));
+  reg.bytes(4, new Uint8Array(32).fill(0x42));
+  reg.bytes(5, new Uint8Array(32).fill(0x43));
+  reg.uint64(6, 1);
+  const req = new ProtoWriter();
+  req.message(5, reg.finish());
+  const parsed = parseRequestMessage(req.finish());
+  assert.equal(parsed.subscriptionRegister.joinId, "join-1");
+  assert.equal(parsed.subscriptionRegister.clientNonce.length, 32);
+  assert.equal(parsed.subscriptionRegister.appliedRevision, 1);
+
+  const fetchReq = new ProtoWriter();
+  fetchReq.message(4, reg.finish());
+  assert.equal(parseRequestMessage(fetchReq.finish()).subscriptionConfig.joinId, "join-1");
+
+  const ping = new ProtoWriter();
+  ping.uint64(1, 99);
+  const pingReq = new ProtoWriter();
+  pingReq.message(7, ping.finish());
+  assert.equal(parseRequestMessage(pingReq.finish()).subscriptionPing.nonce, 99);
+
+  const ack = new ProtoWriter();
+  ack.uint64(1, 1);
+  ack.uint(2, 1); // SUBSCRIPTION_CONFIG_APPLIED
+  ack.string(7, "sub-dev");
+  ack.fixed32(8, ipToInt("10.88.0.9"));
+  ack.uint(9, 24);
+  ack.bytes(14, new Uint8Array(32).fill(0xaa));
+  const ackReq = new ProtoWriter();
+  ackReq.message(6, ack.finish());
+  const parsedAck = parseRequestMessage(ackReq.finish()).subscriptionAck;
+  assert.equal(parsedAck.revision, 1);
+  assert.equal(parsedAck.status, 1);
+  assert.equal(parsedAck.effectiveDeviceName, "sub-dev");
+  assert.equal(parsedAck.effectiveIp, ipToInt("10.88.0.9"));
+  assert.equal(parsedAck.effectiveConfigSha256.length, 32);
+});
+
+test("编码订阅配置信封", () => {
+  const envelope = encodeSubscriptionConfigEnvelope({
+    revision: 3,
+    config: { toml: "mtu = 1400", managedIp: ipToInt("10.88.0.9"), managedPrefixLen: 24, managedDeviceName: "sub-dev" },
+    serverProof: { serverNonce: new Uint8Array(32).fill(0x51), serverProof: new Uint8Array(32).fill(0x52), targetRevision: 3 },
+    networkCode: "smoke",
+    deviceId: "sub-dev",
+    sourceServerId: "abcd",
+    contentSha256: new Uint8Array(32).fill(0x61)
+  });
+  const r = new ProtoReader(envelope);
+  let revision = 0, networkCode = "", deviceId = "", sourceServerId = "", contentSha256 = null;
+  let cfg = null;
+  while (!r.eof()) {
+    const { field, wire } = r.readTag();
+    if (field === 1 && wire === 0) revision = Number(r.readVarint());
+    else if (field === 2 && wire === 2) cfg = r.readBytes();
+    else if (field === 4 && wire === 2) networkCode = r.readString();
+    else if (field === 5 && wire === 2) deviceId = r.readString();
+    else if (field === 6 && wire === 2) sourceServerId = r.readString();
+    else if (field === 7 && wire === 2) contentSha256 = r.readBytes();
+    else r.skip(wire);
+  }
+  assert.equal(revision, 3);
+  assert.equal(networkCode, "smoke");
+  assert.equal(deviceId, "sub-dev");
+  assert.equal(sourceServerId, "abcd");
+  assert.equal(contentSha256.length, 32);
+  const cr = new ProtoReader(cfg);
+  let toml = "", managedIp = 0, prefixLen = 0, deviceName = "";
+  while (!cr.eof()) {
+    const { field, wire } = cr.readTag();
+    if (field === 1 && wire === 2) toml = cr.readString();
+    else if (field === 2 && wire === 5) managedIp = cr.readFixed32();
+    else if (field === 3 && wire === 0) prefixLen = Number(cr.readVarint());
+    else if (field === 4 && wire === 2) deviceName = cr.readString();
+    else cr.skip(wire);
+  }
+  assert.equal(toml, "mtu = 1400");
+  assert.equal(managedIp, ipToInt("10.88.0.9"));
+  assert.equal(prefixLen, 24);
+  assert.equal(deviceName, "sub-dev");
+});
+
+test("编码订阅注册响应消息（ResponseMessage）", () => {
+  const envelope = {
+    revision: 1,
+    config: { toml: "", managedIp: ipToInt("10.88.0.9"), managedPrefixLen: 24, managedDeviceName: "sub-dev" },
+    serverProof: { serverNonce: new Uint8Array(32).fill(0x71), serverProof: new Uint8Array(32).fill(0x72), targetRevision: 1 },
+    networkCode: "smoke",
+    deviceId: "sub-dev",
+    sourceServerId: "src",
+    contentSha256: new Uint8Array(32).fill(0x73)
+  };
+  const res = encodeResponseMessage({ subscriptionRegister: envelope });
+  const r = new ProtoReader(res);
+  let payload = null;
+  while (!r.eof()) {
+    const { field, wire } = r.readTag();
+    if (field === 6 && wire === 2) payload = r.readBytes();
+    else r.skip(wire);
+  }
+  assert.ok(payload && payload.length > 0, "应包含 field 6 subscription_register 信封");
+});
+
+test("订阅密钥证明与内容哈希", async () => {
+  const key = new TextEncoder().encode("credential-key-32-bytes!");
+  const nonce = new Uint8Array(32).fill(0x07);
+  const serverNonce = new Uint8Array(32).fill(0x08);
+  const cp = await clientProof(key, nonce);
+  const sp = await serverProof(key, nonce, serverNonce);
+  assert.equal(cp.length, 32);
+  assert.equal(sp.length, 32);
+  assert.ok(constantTimeEqual(cp, cp), "相同证明应相等");
+  assert.ok(!constantTimeEqual(cp, sp), "不同证明不应相等");
+  assert.ok(!constantTimeEqual(cp, new Uint8Array(31)), "长度不同不应相等");
+  const contentHash = await subscriptionContentSha256("mtu = 1400", ipToInt("10.88.0.9"), 24, "sub-dev");
+  assert.equal(contentHash.length, 32);
+  const sameHash = await subscriptionContentSha256("mtu = 1400", ipToInt("10.88.0.9"), 24, "sub-dev");
+  assert.ok(constantTimeEqual(contentHash, sameHash), "相同内容哈希应一致");
+});
 
 test("编码注册响应 oneof", () => {
   const bytes = encodeRegResponse({

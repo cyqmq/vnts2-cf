@@ -23,7 +23,9 @@ export const MSG = {
   RELAY_PROBE_CLIENT: 18,
   RELAY_PROBE_REPLY_CLIENT: 19,
   SUB_NET_SYNC_REQ: 23,
-  SUB_NET_SYNC_RES: 24
+  SUB_NET_SYNC_RES: 24,
+  SUB_CONFIG_PUSH: 31,
+  SUB_CONFIG_ACK: 32
 };
 
 export const FLAG_COMPRESSED = 0x80;
@@ -39,7 +41,14 @@ export function parseRequestMessage(bytes) {
     else if (field === 2 && wire === 2) {
       r.readBytes();
       out.confirmReg = {};
-    } else r.skip(wire);
+    } else if (field === 3 && wire === 2) {
+      r.readBytes();
+      out.fastReg = {};
+    } else if (field === 4 && wire === 2) out.subscriptionConfig = parseSubscriptionConfigFetchRequest(r.readBytes());
+    else if (field === 5 && wire === 2) out.subscriptionRegister = parseSubscriptionRegisterRequest(r.readBytes());
+    else if (field === 6 && wire === 2) out.subscriptionAck = parseSubscriptionConfigAck(r.readBytes());
+    else if (field === 7 && wire === 2) out.subscriptionPing = parseSubscriptionPing(r.readBytes());
+    else r.skip(wire);
   }
   return out;
 }
@@ -71,7 +80,7 @@ function parseRegRequest(bytes) {
     else if (field === 10 && wire === 2) reg.advertisedSubnets.push(parseIpv4Subnet(r.readBytes()));
     else if (field === 11 && wire === 0) reg.allowIkev2 = r.readBool();
     else if (field === 12 && wire === 0) reg.allowWireguard = r.readBool();
-    else if (field === 13 && wire === 2) r.skip(wire); // subscription：本实现不支持，跳过
+    else if (field === 13 && wire === 2) reg.subscription = parseSubscriptionRegistration(r.readBytes());
     else if (field === 14 && wire === 2) reg.clientInstanceId = r.readBytes();
     else r.skip(wire);
   }
@@ -92,20 +101,221 @@ function parseIpv4Subnet(bytes) {
   return { network: network >>> 0, prefixLen };
 }
 
-export function encodeRegResponse({ ip, prefixLen, gateway, serverVersion, subnetSyncSupported = true }) {
+export function encodeRegResponse({ ip, prefixLen, gateway, serverVersion, subnetSyncSupported = true, subscriptionConfigSupported = false, subscription }) {
   const m = new ProtoWriter();
   m.fixed32(1, ip);
   m.uint(2, prefixLen);
   m.fixed32(3, gateway);
   m.string(4, serverVersion);
   m.bool(5, subnetSyncSupported); // subnet_sync_supported：本实现支持子网同步
-  m.bool(6, false); // subscription_config_supported：本实现未启用订阅配置
-  // field 7 subscription：无
+  m.bool(6, subscriptionConfigSupported); // subscription_config_supported
+  if (subscription) m.message(7, encodeSubscriptionServerProof(subscription)); // 订阅服务端证明
   m.bytes(8, randomInstanceId()); // server_instance_id：客户端期望的实例标识
   m.bool(9, false); // multi_link_supported：本实现未启用多链路
   const w = new ProtoWriter();
   w.message(1, m.finish());
   return w.finish();
+}
+
+/** 解析 SubscriptionRegistration：network_code=1, device_id=2, client_nonce=3, client_proof=4, instance_id=5, applied_revision=6 */
+export function parseSubscriptionRegistration(bytes) {
+  const r = new ProtoReader(bytes);
+  const out = {
+    clientNonce: new Uint8Array(0),
+    clientProof: new Uint8Array(0),
+    instanceId: new Uint8Array(0),
+    appliedRevision: 0
+  };
+  while (!r.eof()) {
+    const { field, wire } = r.readTag();
+    if (field === 1 && wire === 2) out.networkCode = r.readString();
+    else if (field === 2 && wire === 2) out.deviceId = r.readString();
+    else if (field === 3 && wire === 2) out.clientNonce = r.readBytes();
+    else if (field === 4 && wire === 2) out.clientProof = r.readBytes();
+    else if (field === 5 && wire === 2) out.instanceId = r.readBytes();
+    else if (field === 6 && wire === 0) out.appliedRevision = Number(r.readVarint());
+    else r.skip(wire);
+  }
+  return out;
+}
+
+/** 编码 SubscriptionServerProof：server_nonce=1, server_proof=2, target_revision=3 */
+export function encodeSubscriptionServerProof({ serverNonce, serverProof, targetRevision }) {
+  const m = new ProtoWriter();
+  m.bytes(1, serverNonce);
+  m.bytes(2, serverProof);
+  m.uint64(3, targetRevision);
+  return m.finish();
+}
+
+/** 解析 SubscriptionConfigFetchRequest：join_id=1, client_nonce=3, client_proof=4, instance_id=5, applied_revision=6 */
+export function parseSubscriptionConfigFetchRequest(bytes) {
+  return parseSubscriptionRegisterRequest(bytes);
+}
+
+/** 解析 SubscriptionRegisterRequest：join_id=1, client_nonce=3, client_proof=4, instance_id=5, applied_revision=6 */
+export function parseSubscriptionRegisterRequest(bytes) {
+  const r = new ProtoReader(bytes);
+  const out = {
+    joinId: "",
+    clientNonce: new Uint8Array(0),
+    clientProof: new Uint8Array(0),
+    instanceId: new Uint8Array(0),
+    appliedRevision: 0
+  };
+  while (!r.eof()) {
+    const { field, wire } = r.readTag();
+    if (field === 1 && wire === 2) out.joinId = r.readString();
+    else if (field === 3 && wire === 2) out.clientNonce = r.readBytes();
+    else if (field === 4 && wire === 2) out.clientProof = r.readBytes();
+    else if (field === 5 && wire === 2) out.instanceId = r.readBytes();
+    else if (field === 6 && wire === 0) out.appliedRevision = Number(r.readVarint());
+    else r.skip(wire);
+  }
+  return out;
+}
+
+/** 解析 SubscriptionConfigAck（字段见 proto，运行时字段可选） */
+export function parseSubscriptionConfigAck(bytes) {
+  const r = new ProtoReader(bytes);
+  const out = { revision: 0, status: 0, error: "", overriddenFields: [], changedFields: [], effectiveOutput: [], allowIkev2: false, allowWireguard: false, allowMapping: false, effectiveConfigSha256: new Uint8Array(0) };
+  while (!r.eof()) {
+    const { field, wire } = r.readTag();
+    if (field === 1 && wire === 0) out.revision = Number(r.readVarint());
+    else if (field === 2 && wire === 0) out.status = Number(r.readVarint());
+    else if (field === 3 && wire === 2) out.error = r.readString();
+    else if (field === 4 && wire === 2) out.overriddenFields.push(r.readString());
+    else if (field === 5 && wire === 2) out.applyMode = r.readString();
+    else if (field === 6 && wire === 2) out.changedFields.push(r.readString());
+    else if (field === 7 && wire === 2) out.effectiveDeviceName = r.readString();
+    else if (field === 8 && wire === 5) out.effectiveIp = r.readFixed32();
+    else if (field === 9 && wire === 0) out.effectivePrefixLen = Number(r.readVarint());
+    else if (field === 10 && wire === 2) out.effectiveOutput.push(parseIpv4Subnet(r.readBytes()));
+    else if (field === 11 && wire === 0) out.allowIkev2 = r.readBool();
+    else if (field === 12 && wire === 0) out.allowWireguard = r.readBool();
+    else if (field === 13 && wire === 0) out.allowMapping = r.readBool();
+    else if (field === 14 && wire === 2) out.effectiveConfigSha256 = r.readBytes();
+    else r.skip(wire);
+  }
+  return out;
+}
+
+/** 解析 SubscriptionPing：nonce=1 */
+export function parseSubscriptionPing(bytes) {
+  const r = new ProtoReader(bytes);
+  const out = { nonce: 0 };
+  while (!r.eof()) {
+    const { field, wire } = r.readTag();
+    if (field === 1 && wire === 0) out.nonce = Number(r.readVarint());
+    else r.skip(wire);
+  }
+  return out;
+}
+
+/** 编码 ResponseMessage（订阅控制连接使用，无 16 字节包头） */
+export function encodeResponseMessage(response) {
+  const w = new ProtoWriter();
+  if (response.reg) {
+    const m = new ProtoWriter();
+    m.fixed32(1, response.reg.ip);
+    m.uint(2, response.reg.prefixLen);
+    m.fixed32(3, response.reg.gateway);
+    m.string(4, response.reg.serverVersion);
+    m.bool(5, response.reg.subnetSyncSupported ?? true);
+    m.bool(6, response.reg.subscriptionConfigSupported ?? false);
+    if (response.reg.subscription) m.message(7, encodeSubscriptionServerProof(response.reg.subscription));
+    m.bytes(8, response.reg.serverInstanceId || randomInstanceId());
+    m.bool(9, false);
+    w.message(1, m.finish());
+  } else if (response.error) {
+    const m = new ProtoWriter();
+    m.uint(1, response.error.code);
+    m.string(2, response.error.message);
+    w.message(2, m.finish());
+  } else if (response.confirmReg) {
+    const m = new ProtoWriter();
+    m.bool(1, !!response.confirmReg.success);
+    w.message(3, m.finish());
+  } else if (response.subscriptionConfig || response.subscriptionRegister || response.subscriptionPush) {
+    const m = new ProtoWriter();
+    m.message(1, encodeSubscriptionConfigEnvelope(
+      response.subscriptionConfig || response.subscriptionRegister || response.subscriptionPush
+    ));
+    const field = response.subscriptionRegister ? 6 : response.subscriptionPush ? 7 : 5;
+    w.message(field, m.finish());
+  } else if (response.subscriptionPong) {
+    const m = new ProtoWriter();
+    m.uint64(1, response.subscriptionPong.nonce);
+    w.message(8, m.finish());
+  }
+  return w.finish();
+}
+
+/** 编码 SubscriptionConfigEnvelope：revision=1, config=2, server_proof=3, network_code=4, device_id=5, source_server_id=6, content_sha256=7 */
+export function encodeSubscriptionConfigEnvelope({ revision, config, serverProof, networkCode, deviceId, sourceServerId, contentSha256 }) {
+  const m = new ProtoWriter();
+  m.uint64(1, revision);
+  const cfg = new ProtoWriter();
+  cfg.string(1, config.toml);
+  cfg.fixed32(2, config.managedIp);
+  cfg.uint(3, config.managedPrefixLen);
+  cfg.string(4, config.managedDeviceName);
+  m.message(2, cfg.finish());
+  m.message(3, encodeSubscriptionServerProof(serverProof));
+  m.string(4, networkCode);
+  m.string(5, deviceId);
+  m.string(6, sourceServerId);
+  m.bytes(7, contentSha256);
+  return m.finish();
+}
+
+/** 客户端证明：SHA256(credential_key || 0x01 || client_nonce) */
+export async function clientProof(credentialKey, clientNonce) {
+  return sha256Bytes(concatBytes([credentialKey, new Uint8Array([0x01]), clientNonce]));
+}
+
+/** 服务端证明：SHA256(credential_key || 0x02 || client_nonce || server_nonce) */
+export async function serverProof(credentialKey, clientNonce, serverNonce) {
+  return sha256Bytes(concatBytes([credentialKey, new Uint8Array([0x02]), clientNonce, serverNonce]));
+}
+
+/** 订阅配置内容哈希：SHA256(toml || managed_ip(4字节) || [prefix_len] || managed_device_name) */
+export async function subscriptionContentSha256(toml, managedIp, managedPrefixLen, managedDeviceName) {
+  const ipBytes = new Uint8Array(4);
+  new DataView(ipBytes.buffer).setUint32(0, managedIp >>> 0, false);
+  return sha256Bytes(concatBytes([
+    new TextEncoder().encode(toml),
+    ipBytes,
+    new Uint8Array([managedPrefixLen]),
+    new TextEncoder().encode(managedDeviceName)
+  ]));
+}
+
+export async function sha256Bytes(bytes) {
+  const hash = await crypto.subtle.digest("SHA-256", bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes));
+  return new Uint8Array(hash);
+}
+
+/** 恒定时间比较两个字节数组 */
+export function constantTimeEqual(a, b) {
+  const left = a instanceof Uint8Array ? a : new Uint8Array(a);
+  const right = b instanceof Uint8Array ? b : new Uint8Array(b);
+  if (left.length !== right.length) return false;
+  let diff = 0;
+  for (let i = 0; i < left.length; i++) diff |= left[i] ^ right[i];
+  return diff === 0;
+}
+
+function concatBytes(parts) {
+  let total = 0;
+  for (const part of parts) total += part.length;
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const part of parts) {
+    out.set(part, offset);
+    offset += part.length;
+  }
+  return out;
 }
 
 /** 解析 SubnetSyncRequest：bytes known_hash=1 */

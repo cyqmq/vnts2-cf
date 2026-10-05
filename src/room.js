@@ -1,22 +1,30 @@
 import {
+  HEAD_LENGTH,
   MSG,
+  clientProof,
+  constantTimeEqual,
   decrementTtl,
   encodeClientSimpleInfoList,
   encodeConfirmRegResponse,
   encodeErrorResponse,
   encodeRegResponse,
+  encodeResponseMessage,
   encodeRpcClientListResponse,
   encodeServerMessage,
   encodeSubnetSyncResponse,
+  encodeSubscriptionConfigEnvelope,
   makePacket,
   parseRequestMessage,
   parseRpcRequest,
   parseSelectiveBroadcast,
   parseServerMessage,
   parseSubnetSyncRequest,
-  readPacket
+  parseSubscriptionConfigAck,
+  readPacket,
+  serverProof,
+  subscriptionContentSha256
 } from "./protocol.js";
-import { contains, defaultNetworkConfig, intToIp, networkConfigFromClientIp, networkConfigFromGateway, parseNetworks } from "./ip.js";
+import { contains, defaultNetworkConfig, intToIp, ipToInt, networkConfigFromClientIp, networkConfigFromGateway, parseNetworks } from "./ip.js";
 import { SERVER_VERSION as GEN_VERSION } from "./version.js";
 import { setUiVersion } from "./ui.js";
 import { renderHealthHtml, renderLoginPage, renderRegisterPage, renderLoginHtml, renderRoomHtml, renderRoomListHtml, renderPeerLoginHtml, renderPeerHtml, renderLogLoginHtml, renderLogHtml, renderSettingsHtml, renderAdminLoginHtml, renderAdminHtml, renderConfigHtml, renderDashboardHtml, renderAboutPage } from "./ui-pages.js";
@@ -28,6 +36,7 @@ const ACCOUNTS_KEY = "vnts2-accounts";
 const SESSIONS_KEY = "vnts2-sessions";
 const INVITES_KEY = "vnts2-invites";
 const REG_MODE_KEY = "vnts2-registration-mode";
+const SUBSCRIPTIONS_KEY = "vnts2-subscriptions";
 const REG_MODE_OPEN = "open";
 const REG_MODE_INVITE = "invite";
 const REG_MODE_CLOSED = "closed";
@@ -89,6 +98,8 @@ export class Vnts2Room {
     this._logPersistScheduled = false;
     // 管理员为每个房间设置的组网密码（networkCode -> password），用于客户端配置文件
     this.networkPasswords = new Map();
+    // 订阅配置（joinId -> subscription 对象）：服务端受管设备配置与凭据
+    this.subscriptions = new Map();
   }
 
   async fetch(request) {
@@ -182,6 +193,21 @@ export class Vnts2Room {
     if (this.peerToken) this.peerTokenHash = await sha256Hex(this.peerToken);
     if (this.logPassword) this.logPasswordHash = await sha256Hex(this.logPassword);
     if (this.adminPassword) this.adminPasswordHash = await sha256Hex(this.adminPassword);
+    // 恢复订阅配置（joinId -> subscription 对象）
+    try {
+      const savedSubs = await this.state.storage.get(SUBSCRIPTIONS_KEY);
+      if (savedSubs && typeof savedSubs === "object" && !Array.isArray(savedSubs)) {
+        for (const [joinId, sub] of Object.entries(savedSubs)) {
+          if (joinId && sub && typeof sub === "object" &&
+              typeof sub.networkCode === "string" && typeof sub.deviceId === "string" &&
+              typeof sub.credentialKey === "string" && isUint32(sub.managedIp)) {
+            this.subscriptions.set(joinId, sub);
+          }
+        }
+      }
+    } catch (error) {
+      this.reportError("恢复订阅配置失败", error);
+    }
     // 恢复服务端账户（用户名 + 密码哈希 + 已加入房间）
     try {
       const savedAccounts = await this.state.storage.get(ACCOUNTS_KEY);
@@ -307,6 +333,10 @@ export class Vnts2Room {
     if (!session) return;
     const bytes = await toBytes(raw);
     if (bytes.length > MAX_MESSAGE_BYTES) throw new Error(`消息超过大小限制：${bytes.length} > ${MAX_MESSAGE_BYTES}`);
+    if (session.isSubscriptionControl) {
+      await this.handleSubscriptionControlMessage(session, bytes);
+      return;
+    }
     if (!session.registered) {
       await this.handleRegister(session, bytes);
       return;
@@ -326,6 +356,14 @@ export class Vnts2Room {
 
   async handleRegister(session, bytes) {
     const req = parseRequestMessage(bytes);
+    if (req.subscriptionRegister) {
+      await this.handleSubscriptionRegister(session, req.subscriptionRegister);
+      return;
+    }
+    if (req.subscriptionConfig) {
+      await this.handleSubscriptionConfigFetch(session, req.subscriptionConfig);
+      return;
+    }
     if (!req.reg) throw new Error("首包必须是注册请求");
     const reg = req.reg;
     this.validateReg(reg);
@@ -359,12 +397,182 @@ export class Vnts2Room {
     device.sessionId = session.id;
     device.online = true;
 
-    this.send(session, encodeRegResponse({ ip, prefixLen: cfg.prefix, gateway: cfg.gateway, serverVersion: this.serverVersion }));
+    // 订阅受管设备：验证订阅身份并生成服务端证明
+    let subscription = undefined;
+    let subscriptionConfigSupported = false;
+    if (reg.subscription) {
+      subscription = await this.authenticateSubscription(reg.subscription);
+      subscriptionConfigSupported = true;
+      this.logInfo(`订阅设备注册验证通过 网络编号=${reg.networkCode} 设备ID=${reg.deviceId} revision=${reg.subscription.appliedRevision}`);
+    }
+
+    this.send(session, encodeRegResponse({ ip, prefixLen: cfg.prefix, gateway: cfg.gateway, serverVersion: this.serverVersion, subscriptionConfigSupported, subscription }));
     this.logInfo(`注册成功 网络编号=${reg.networkCode} 设备ID=${reg.deviceId} 虚拟IP=${intToIp(ip)} 注册模式=${session.pendingConfirmation ? "预注册" : "普通"} 客户端版本=${reg.version || "未知"}${reg.name ? ` 设备名称=${reg.name}` : ""}`);
     if (!session.pendingConfirmation) {
       await this.persistSoon();
       this.logDebug(`注册后持久化完成 网络编号=${reg.networkCode} 设备ID=${reg.deviceId} 虚拟IP=${intToIp(ip)}`);
     }
+  }
+
+  async handleSubscriptionRegister(session, request) {
+    const sub = this.findSubscriptionByJoinId(request.joinId);
+    if (!sub) throw new Error("订阅链接无效，或设备已被删除");
+    if (request.clientNonce.length !== 32 || request.clientProof.length !== 32) throw new Error("订阅链接客户端证明无效");
+    const proof = await this.makeSubscriptionServerProof(sub, request);
+    if (request.appliedRevision > sub.revision) throw new Error(`客户端受管配置 revision ${request.appliedRevision} 超过服务端 revision ${sub.revision}`);
+    session.isSubscriptionControl = true;
+    session.subscriptionJoinId = sub.joinId;
+    session.subscriptionIdentity = { networkCode: sub.networkCode, deviceId: sub.deviceId };
+    session.subscriptionRandomId = randomUint32();
+    session.subscriptionAppliedRevision = request.appliedRevision;
+    const envelope = await this.buildSubscriptionEnvelope(sub, proof);
+    this.logInfo(`订阅控制连接建立 网络编号=${sub.networkCode} 设备ID=${sub.deviceId} joinId=${sub.joinId} revision=${sub.revision}`);
+    this.send(session, encodeResponseMessage({ subscriptionRegister: envelope }));
+  }
+
+  async handleSubscriptionConfigFetch(session, request) {
+    const sub = this.findSubscriptionByJoinId(request.joinId);
+    if (!sub) throw new Error("订阅链接无效，或设备已被删除");
+    if (request.clientNonce.length !== 32 || request.clientProof.length !== 32) throw new Error("订阅链接客户端证明无效");
+    const proof = await this.makeSubscriptionServerProof(sub, request);
+    const envelope = await this.buildSubscriptionEnvelope(sub, proof);
+    this.logInfo(`订阅配置获取 网络编号=${sub.networkCode} 设备ID=${sub.deviceId} joinId=${sub.joinId} revision=${sub.revision}`);
+    this.send(session, encodeResponseMessage({ subscriptionConfig: envelope }));
+  }
+
+  async handleSubscriptionControlMessage(session, bytes) {
+    // 客户端回执（SubscriptionConfigAck）是带 16 字节头的 NetPacket（msgType=32）
+    if (bytes.length >= HEAD_LENGTH && (bytes[0] & 0x7f) === MSG.SUB_CONFIG_ACK) {
+      const packet = readPacket(bytes);
+      const ack = parseSubscriptionConfigAck(packet.payload);
+      const identity = session.subscriptionIdentity || {};
+      this.logInfo(`订阅配置回执 网络编号=${identity.networkCode || ""} 设备ID=${identity.deviceId || ""} revision=${ack.revision} status=${ack.status}`);
+      if (ack.status === 1) session.subscriptionAppliedRevision = ack.revision;
+      return;
+    }
+    // 心跳等请求是裸 RequestMessage
+    const req = parseRequestMessage(bytes);
+    if (req.subscriptionPing) {
+      this.send(session, encodeResponseMessage({ subscriptionPong: { nonce: req.subscriptionPing.nonce } }));
+      return;
+    }
+    if (req.subscriptionAck) {
+      const identity = session.subscriptionIdentity || {};
+      this.logInfo(`订阅配置回执 网络编号=${identity.networkCode || ""} 设备ID=${identity.deviceId || ""} revision=${req.subscriptionAck.revision} status=${req.subscriptionAck.status}`);
+      if (req.subscriptionAck.status === 1) {
+        session.subscriptionAppliedRevision = req.subscriptionAck.revision;
+      }
+      return;
+    }
+    this.logDebug("订阅控制连接收到未知消息，忽略");
+  }
+
+  /** 从订阅注册消息验证身份并生成服务端证明（含随机 server_nonce） */
+  async makeSubscriptionServerProof(sub, request) {
+    const credentialKey = decodeBase64UrlNoPad(sub.credentialKey);
+    if (!credentialKey || credentialKey.length !== 32) throw new Error("订阅链接凭据无效");
+    const expected = await clientProof(credentialKey, request.clientNonce);
+    if (!constantTimeEqual(expected, request.clientProof)) throw new Error("订阅链接凭据无效或已被重新签发");
+    const serverNonce = new Uint8Array(32);
+    crypto.getRandomValues(serverNonce);
+    const proofBytes = await serverProof(credentialKey, request.clientNonce, serverNonce);
+    return { serverNonce, serverProof: proofBytes, targetRevision: sub.revision };
+  }
+
+  /** 构建订阅配置信封（含内容 SHA-256） */
+  async buildSubscriptionEnvelope(sub, proof) {
+    const managedIp = sub.managedIp >>> 0;
+    const contentSha256 = await subscriptionContentSha256(sub.toml || "", managedIp, sub.managedPrefixLen, sub.managedDeviceName);
+    return {
+      revision: sub.revision,
+      config: {
+        toml: sub.toml || "",
+        managedIp,
+        managedPrefixLen: sub.managedPrefixLen,
+        managedDeviceName: sub.managedDeviceName
+      },
+      serverProof: proof,
+      networkCode: sub.networkCode,
+      deviceId: sub.deviceId,
+      sourceServerId: this.serverInstanceIdHex(),
+      contentSha256
+    };
+  }
+
+  /** 普通注册时验证订阅身份（SubscriptionRegistration） */
+  async authenticateSubscription(registration) {
+    const sub = this.findSubscriptionByDevice(registration.networkCode, registration.deviceId);
+    if (!sub) throw new Error(`订阅设备 ${registration.networkCode}/${registration.deviceId} 未找到有效订阅配置`);
+    if (registration.clientNonce.length !== 32 || registration.clientProof.length !== 32) throw new Error("订阅链接客户端证明无效");
+    const proof = await this.makeSubscriptionServerProof(sub, registration);
+    return proof;
+  }
+
+  findSubscriptionByJoinId(joinId) {
+    return this.subscriptions.get(joinId) || null;
+  }
+
+  findSubscriptionByDevice(networkCode, deviceId) {
+    for (const sub of this.subscriptions.values()) {
+      if (sub.networkCode === networkCode && sub.deviceId === deviceId && sub.enabled !== false) return sub;
+    }
+    return null;
+  }
+
+  /** 服务端实例 ID 的十六进制表示（订阅信封 source_server_id） */
+  serverInstanceIdHex() {
+    if (!this._serverInstanceId) {
+      const buf = new Uint8Array(16);
+      crypto.getRandomValues(buf);
+      this._serverInstanceId = buf;
+    }
+    return Array.from(this._serverInstanceId).map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  /** 签发订阅链接：payload 为 v2 结构（server, cert_mode, join_id, credential_key） */
+  issueSubscriptionLink(sub) {
+    const payload = {
+      v: 2,
+      server: sub.subscriptionServer || this.defaultSubscriptionServer(),
+      cert_mode: sub.certMode || "standard",
+      join_id: sub.joinId,
+      credential_key: sub.credentialKey
+    };
+    const encoded = encodeBase64UrlNoPad(new TextEncoder().encode(JSON.stringify(payload)));
+    return `vnt2://join/2/${encoded}`;
+  }
+
+  defaultSubscriptionServer() {
+    return this.env.SUBSCRIPTION_SERVER || "";
+  }
+
+  /** 创建订阅配置记录（管理员 API 使用） */
+  async createSubscriptionRecord(input) {
+    const sub = {
+      joinId: input.joinId || crypto.randomUUID(),
+      networkCode: String(input.networkCode || "").trim(),
+      deviceId: String(input.deviceId || "").trim(),
+      credentialKey: input.credentialKey || randomBase64UrlKey(),
+      revision: Number.isInteger(input.revision) && input.revision > 0 ? input.revision : 1,
+      toml: String(input.toml || ""),
+      managedIp: input.managedIp >>> 0,
+      managedPrefixLen: Number.isInteger(input.managedPrefixLen) && input.managedPrefixLen > 0 ? input.managedPrefixLen : 24,
+      managedDeviceName: String(input.managedDeviceName || "").trim(),
+      subscriptionServer: String(input.subscriptionServer || this.defaultSubscriptionServer()).trim(),
+      certMode: String(input.certMode || "standard").trim(),
+      enabled: input.enabled !== false,
+      createdAt: Date.now(),
+      updatedAt: Date.now()
+    };
+    this.subscriptions.set(sub.joinId, sub);
+    await this.saveSubscriptions();
+    return sub;
+  }
+
+  async saveSubscriptions() {
+    const out = {};
+    for (const [joinId, sub] of this.subscriptions) out[joinId] = sub;
+    await this.state.storage.put(SUBSCRIPTIONS_KEY, out);
   }
 
   validateReg(reg) {
@@ -905,9 +1113,9 @@ export class Vnts2Room {
     const now = Date.now();
     let deletedDevices = 0;
     let deletedNetworks = 0;
-    // 安全：回收长时间未注册的 WebSocket 会话，防止空连接占满 MAX_SESSIONS
+    // 安全：回收长时间未注册的 WebSocket 会话，防止空连接占满 MAX_SESSIONS（订阅控制连接是长连接，不回收）
     for (const session of Array.from(this.sessions.values())) {
-      if (!session.registered && now - (session.openedAt || now) > SESSION_IDLE_TIMEOUT_MS) {
+      if (!session.registered && !session.isSubscriptionControl && now - (session.openedAt || now) > SESSION_IDLE_TIMEOUT_MS) {
         this.sessions.delete(session.id);
         try {
           session.socket.close(4000, "registration timeout");
@@ -1587,7 +1795,96 @@ export class Vnts2Room {
     if (url.pathname === "/api/admin/invites" && request.method === "GET") return this.handleAdminListInvites(request);
     if (url.pathname === "/api/admin/invites" && request.method === "POST") return this.handleAdminCreateInvite(request);
     if (url.pathname === "/api/admin/invites/disable" && request.method === "POST") return this.handleAdminDisableInvite(request);
+    if (url.pathname === "/api/admin/subscriptions" && request.method === "GET") return this.handleAdminListSubscriptions(request);
+    if (url.pathname === "/api/admin/subscriptions" && request.method === "POST") return this.handleAdminCreateSubscription(request);
+    if (url.pathname === "/api/admin/subscriptions/issue" && request.method === "POST") return this.handleAdminIssueSubscription(request);
     return Response.json({ error: "未知接口" }, { status: 404 });
+  }
+
+  async handleAdminListSubscriptions(request) {
+    if (!await this.requireAdmin(request)) return Response.json({ error: "未授权" }, { status: 401 });
+    const list = [];
+    for (const sub of this.subscriptions.values()) {
+      list.push({
+        joinId: sub.joinId,
+        networkCode: sub.networkCode,
+        deviceId: sub.deviceId,
+        revision: sub.revision,
+        managedIp: intToIp(sub.managedIp >>> 0),
+        managedPrefixLen: sub.managedPrefixLen,
+        managedDeviceName: sub.managedDeviceName,
+        enabled: sub.enabled !== false,
+        createdAt: sub.createdAt,
+        updatedAt: sub.updatedAt,
+        link: this.issueSubscriptionLink(sub)
+      });
+    }
+    return Response.json({ ok: true, subscriptions: list });
+  }
+
+  async handleAdminCreateSubscription(request) {
+    if (!await this.requireAdmin(request)) return Response.json({ error: "未授权" }, { status: 401 });
+    let body = null;
+    try {
+      body = await request.json();
+    } catch {}
+    const networkCode = String(body?.networkCode || "").trim();
+    const deviceId = String(body?.deviceId || "").trim();
+    let managedIp = null;
+    try {
+      managedIp = ipToInt(String(body?.managedIp || "").trim());
+    } catch {}
+    const managedPrefixLen = Number.isInteger(body?.managedPrefixLen) ? Number(body.managedPrefixLen) : 24;
+    const managedDeviceName = String(body?.managedDeviceName || "").trim();
+    const toml = String(body?.toml || "");
+    const subscriptionServer = String(body?.subscriptionServer || "").trim();
+    const certMode = String(body?.certMode || "standard").trim();
+    if (!networkCode || networkCode.length > 32) return Response.json({ error: "网络编号无效" }, { status: 400 });
+    if (!deviceId || deviceId.length > 64) return Response.json({ error: "设备 ID 无效" }, { status: 400 });
+    if (managedIp === null) return Response.json({ error: "受管 IP 无效" }, { status: 400 });
+    if (!this.isNetworkAllowedByConfig(networkCode)) return Response.json({ error: "网络不在允许列表中" }, { status: 400 });
+    if (this.findSubscriptionByDevice(networkCode, deviceId)) return Response.json({ error: "该设备已有订阅配置" }, { status: 409 });
+    const sub = await this.createSubscriptionRecord({
+      networkCode,
+      deviceId,
+      managedIp,
+      managedPrefixLen,
+      managedDeviceName: managedDeviceName || deviceId,
+      toml,
+      subscriptionServer,
+      certMode
+    });
+    this.logInfo(`创建订阅配置 网络编号=${networkCode} 设备ID=${deviceId} joinId=${sub.joinId} IP=${intToIp(managedIp)}`);
+    return Response.json({
+      ok: true,
+      subscription: {
+        joinId: sub.joinId,
+        networkCode: sub.networkCode,
+        deviceId: sub.deviceId,
+        revision: sub.revision,
+        managedIp: intToIp(sub.managedIp >>> 0),
+        managedPrefixLen: sub.managedPrefixLen,
+        managedDeviceName: sub.managedDeviceName,
+        link: this.issueSubscriptionLink(sub)
+      }
+    });
+  }
+
+  async handleAdminIssueSubscription(request) {
+    if (!await this.requireAdmin(request)) return Response.json({ error: "未授权" }, { status: 401 });
+    let body = null;
+    try {
+      body = await request.json();
+    } catch {}
+    const joinId = String(body?.joinId || "");
+    const sub = this.findSubscriptionByJoinId(joinId);
+    if (!sub) return Response.json({ error: "订阅配置不存在" }, { status: 404 });
+    sub.credentialKey = randomBase64UrlKey();
+    sub.revision = (sub.revision || 0) + 1;
+    sub.updatedAt = Date.now();
+    await this.saveSubscriptions();
+    this.logInfo(`重新签发订阅链接 joinId=${joinId} 网络编号=${sub.networkCode} 设备ID=${sub.deviceId} revision=${sub.revision}`);
+    return Response.json({ ok: true, link: this.issueSubscriptionLink(sub), revision: sub.revision });
   }
 
   /** 从 HttpOnly 会话 Cookie 中解析当前账户；未登录返回 null */
@@ -2160,6 +2457,41 @@ function randomHex(bytes) {
   const buf = new Uint8Array(bytes);
   crypto.getRandomValues(buf);
   return Array.from(buf).map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+/** Base64 URL 安全无填充编码 */
+function encodeBase64UrlNoPad(bytes) {
+  let binary = "";
+  for (const b of bytes) binary += String.fromCharCode(b);
+  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/g, "");
+}
+
+/** Base64 URL 安全无填充解码；失败返回 null */
+function decodeBase64UrlNoPad(value) {
+  try {
+    const normalized = String(value).replace(/-/g, "+").replace(/_/g, "/");
+    const padded = normalized.padEnd(Math.ceil(normalized.length / 4) * 4, "=");
+    const binary = atob(padded);
+    const out = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+}
+
+/** 生成 32 字节随机订阅凭据（Base64 URL 安全无填充） */
+function randomBase64UrlKey() {
+  const buf = new Uint8Array(32);
+  crypto.getRandomValues(buf);
+  return encodeBase64UrlNoPad(buf);
+}
+
+/** 生成 32 位无符号随机数（订阅会话标识） */
+function randomUint32() {
+  const buf = new Uint8Array(4);
+  crypto.getRandomValues(buf);
+  return ((buf[0] << 24) | (buf[1] << 16) | (buf[2] << 8) | buf[3]) >>> 0;
 }
 
 /** 生成 8 位随机邀请码（去掉易混淆字符） */

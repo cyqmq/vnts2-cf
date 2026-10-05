@@ -150,13 +150,35 @@ cd test
 - 线上部署：使用 `wrangler secret put` 注入 Secrets。
 - `README.md` 已补充完整部署指南（CLI + GitHub 集成 + 自定义域名 + Secrets）。
 
+### 4.7 子网同步（SubnetSync）与 vnt 2.0.10 注册新字段
+
+- `src/protocol.js`：
+  - 注册请求解析 `advertised_subnets`(10)、`allow_ikev2`(11)、`allow_wireguard`(12)、`client_instance_id`(14)。
+  - 注册响应补齐 `subnet_sync_supported`(5)、`subscription_config_supported`(6)、`server_instance_id`(8)。
+  - 新增 `SubnetSyncReq/Res`（包类型 23/24）编解码；`encodeClientSimpleInfoList` 带 `ClientType`。
+- `src/room.js`：设备保存新字段；处理 `SubnetSyncReq`，生成 canonical 快照哈希（SHA-256，重复 CIDR 只保留最小节点 IP）。
+- 实测：客户端宣告 `192.168.10.0/24`，`SubnetSyncRes` 正确返回多节点子网路由。
+
+### 4.8 订阅配置（Subscription）
+
+- 认证机制：**不依赖 X.509 证书**。`client_proof=SHA256(credential_key‖0x01‖client_nonce)`，`server_proof=SHA256(key‖0x02‖nonce‖server_nonce)`，全部用 Web Crypto 实现。
+- `cert_mode`：订阅链接可带 `standard`（生产用公共 CA 验证）或 `finger:<证书指纹>`（本地 wrangler 自签证书用）。
+- `src/protocol.js`：订阅消息编解码（`SubscriptionRegistration`、`SubscriptionConfigEnvelope`、`SubscriptionServerProof`、`SubscriptionConfigFetchRequest/RegisterRequest/Ack/Ping`、`ResponseMessage` 封装）。
+- `src/room.js`：
+  - DO Storage 键 `vnts2-subscriptions`：`joinId → {networkCode, deviceId, credentialKey, revision, toml, managedIp, managedPrefixLen, managedDeviceName, subscriptionServer, certMode}`。
+  - 首包分发：`SubscriptionRegisterRequest` → 返回 `ResponseMessage{subscription_register: envelope}` 并建立订阅控制长连接（心跳 Ping/Pong、ACK）。
+  - 普通注册携带 `subscription` 字段时验证共享密钥证明并返回 `SubscriptionServerProof`。
+  - 管理 API：`GET/POST /api/admin/subscriptions`、`POST /api/admin/subscriptions/issue`（重新签发）。
+- 客户端实测（vnt 2.0.10 `--sub <link>`）：自动获取受管配置 `10.88.0.32/24` 并启动网络，订阅长连接稳定保持（>60s）。
+- 注意：vnt 2.0.10 订阅设备（固定 IP）**不发起普通流量注册**，订阅控制连接仅用于配置分发与控制；设备不进入 P2P 数据平面。
+
 ---
 
 ## 5. 测试
 
-- `test/protocol.test.js`（9 个）：协议编解码、IP 分配、protobuf 安全边界。
+- `test/protocol.test.js`（18 个）：协议编解码、IP 分配、protobuf 安全边界、子网同步、订阅协议与密钥证明。
 - `test/ui.test.js`（10 个）：4 个登录页 `</script>` 转义 + 无 message 渲染、注册页包含注册接口与模式查询、登录页不再包含自动注册逻辑。
-- 当前 `npm test`：**19/19 通过**。
+- 当前 `npm test`：**28/28 通过**。
 - 注意：`test/ui.test.js` 断言字符串为 `\u003c/script>`（jsonScript 只转义 `<`）。
 
 ---
