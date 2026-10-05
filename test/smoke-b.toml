@@ -1,0 +1,9 @@
+network_code = "smoke"
+server = ["wss://127.0.0.1:8787"]
+
+ip = "10.88.0.3"
+device_name = "smoke-client-b"
+device_id = "22222222-2222-4222-8222-222222222222"
+cert_mode = "skip"
+ctrl_port = 11322
+no_tun = true

@@ -26,6 +26,37 @@ test("解码 vnts2 注册请求", () => {
   assert.equal(msg.reg.registrationMode, 1);
 });
 
+test("解码含 client_instance_id 的 vnt 2.0.10 注册请求（skip 边界）", () => {
+  // vnt 2.0.10 请求会携带字段 14（client_instance_id，32 字节），
+  // 曾触发 ProtoReader.skip 的 += 求值顺序 bug 导致解析错位。
+  const reg = new ProtoWriter();
+  reg.string(1, "smoke");
+  reg.string(2, "v210-dev");
+  reg.string(4, "v210-dev");
+  reg.string(5, "2.0.10");
+  reg.bool(7, true);
+  reg.bytes(14, new Uint8Array(32).fill(0xab));
+  const req = new ProtoWriter();
+  req.message(1, reg.finish());
+
+  const msg = parseRequestMessage(req.finish());
+  assert.equal(msg.reg.networkCode, "smoke");
+  assert.equal(msg.reg.deviceId, "v210-dev");
+  assert.equal(msg.reg.version, "2.0.10");
+  assert.equal(msg.reg.ipVariable, true);
+});
+
+test("ProtoReader.skip 对 length-delimited 字段精确定位", () => {
+  const w = new ProtoWriter();
+  w.bytes(14, new Uint8Array(32).fill(0xab));
+  const r = new ProtoReader(w.finish());
+  const { field, wire } = r.readTag();
+  assert.equal(field, 14);
+  assert.equal(wire, 2);
+  r.skip(wire);
+  assert.equal(r.eof(), true, "skip 后应精确到达末尾，不再残留字节");
+});
+
 test("编码注册响应 oneof", () => {
   const bytes = encodeRegResponse({
     ip: ipToInt("10.26.0.2"),

@@ -67,9 +67,21 @@ export function encodeRegResponse({ ip, prefixLen, gateway, serverVersion }) {
   m.uint(2, prefixLen);
   m.fixed32(3, gateway);
   m.string(4, serverVersion);
+  m.bool(5, false); // subnet_sync_supported：本实现未启用子网同步
+  m.bool(6, false); // subscription_config_supported：本实现未启用订阅配置
+  // field 7 subscription：无
+  m.bytes(8, randomInstanceId()); // server_instance_id：客户端期望的实例标识
+  m.bool(9, false); // multi_link_supported：本实现未启用多链路
   const w = new ProtoWriter();
   w.message(1, m.finish());
   return w.finish();
+}
+
+/** 生成 32 字节随机实例 ID（Cloudflare Workers / Node 均支持） */
+function randomInstanceId() {
+  const buf = new Uint8Array(32);
+  crypto.getRandomValues(buf);
+  return buf;
 }
 
 export function encodeErrorResponse(code, message) {

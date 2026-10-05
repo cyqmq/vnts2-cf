@@ -4,4 +4,5 @@ node_modules/
 *.log
 test/PORT
 test/logs/
+test/example_config.toml
 .dev.vars

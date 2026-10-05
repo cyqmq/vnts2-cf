@@ -70,7 +70,11 @@ export class ProtoReader {
     } else if (wire === 1) {
       this.pos += 8;
     } else if (wire === 2) {
-      this.pos += Number(this.readVarint());
+      // 注意：不能写成 this.pos += Number(this.readVarint())
+      // JS 会先求值左操作数 this.pos（旧值），而 readVarint 内部已移动 pos，
+      // 导致少加 1 字节，多字节 varint 时误差更大。
+      const len = Number(this.readVarint());
+      this.pos += len;
     } else if (wire === 5) {
       this.pos += 4;
     } else {
